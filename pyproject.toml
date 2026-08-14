@@ -1,0 +1,13 @@
+[project]
+name = "my-agent"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
