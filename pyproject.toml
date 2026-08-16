@@ -5,9 +5,32 @@ requires-python = ">=3.10"
 
 dependencies = [
     "python-dotenv>=1.0,<2",
+    "langgraph>=1.2.11,<2",
+    "langchain-openai>=1.5.1,<2"
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<9",
+    "ruff>=0.16.3,<0.17"
 ]
+
+[build-system]
+requires = ["setuptools>=75.3"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+my-agent = "my_agent.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E","F","I"]
