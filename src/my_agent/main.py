@@ -1,5 +1,8 @@
 import sys
+
 from my_agent.config import load_config
+
+
 def main() -> int:
     try:
         config = load_config()
@@ -13,6 +16,7 @@ def main() -> int:
         print(f"{name}: {value}")
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

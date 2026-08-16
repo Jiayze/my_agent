@@ -1,7 +1,14 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
 from dotenv import load_dotenv
+
+VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+TRUE_VALUES = frozenset({"true", "1", "yes"})
+FALSE_VALUES = frozenset({"false", "0", "no"})
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     api_key: str
@@ -22,11 +29,12 @@ class AgentConfig:
         }
 
 
-CURRENT_FILE=Path(__file__).resolve()
+CURRENT_FILE = Path(__file__).resolve()
 PROJECT_ROOT = CURRENT_FILE.parent.parent.parent
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
-def load_config(env_file: str | Path |None = DEFAULT_ENV_PATH) -> AgentConfig:
+
+def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
     if env_file is not None:
         load_dotenv(dotenv_path=env_file)
 
@@ -34,12 +42,11 @@ def load_config(env_file: str | Path |None = DEFAULT_ENV_PATH) -> AgentConfig:
     if not api_key:
         raise ValueError("DEEPSEEK_API_KEY is required")
 
-    model_id=os.getenv("MODEL_ID","deepseek-v4-flash").strip()
+    model_id = os.getenv("MODEL_ID", "deepseek-v4-flash").strip()
     if not model_id:
         raise ValueError("MODEL_ID is required")
 
-    base_url=os.getenv("BASE_URL","https://api.deepseek.com").strip()
-
+    base_url = os.getenv("BASE_URL", "https://api.deepseek.com").strip()
 
     raw_workspace_root = os.getenv("WORKSPACE_ROOT", "").strip()
     if raw_workspace_root:
@@ -55,16 +62,16 @@ def load_config(env_file: str | Path |None = DEFAULT_ENV_PATH) -> AgentConfig:
             f"WORKSPACE_ROOT is not a directory: {workspace_root}"
         )
 
-    log_level=os.getenv("LOG_LEVEL","INFO").strip().upper()
-    if not log_level in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    if log_level not in VALID_LOG_LEVELS:
         raise ValueError(
             "log_level should be one of 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'"
         )
 
     raw_allow_shell = os.getenv("ALLOW_SHELL", "false").strip().lower()
-    if raw_allow_shell in {"true","1", "yes"}:
+    if raw_allow_shell in TRUE_VALUES:
         allow_shell = True
-    elif raw_allow_shell in {"false","0", "no"}:
+    elif raw_allow_shell in FALSE_VALUES:
         allow_shell = False
     else:
         raise ValueError(
@@ -79,6 +86,3 @@ def load_config(env_file: str | Path |None = DEFAULT_ENV_PATH) -> AgentConfig:
         log_level=log_level,
         allow_shell=allow_shell,
     )
-if __name__ == "__main__":
-    config = load_config()
-    print(config.safe_summary())

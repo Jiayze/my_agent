@@ -5,7 +5,7 @@ from my_agent.config import PROJECT_ROOT
 
 
 def test_main_prints_safe_summary_for_valid_configuration(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
     monkeypatch.setenv("MODEL_ID", "test-model")
@@ -26,7 +26,7 @@ def test_main_prints_safe_summary_for_valid_configuration(
 
 
 def test_main_reports_configuration_errors_to_stderr(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # An empty value keeps load_dotenv() from replacing it with a real .env key.
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")

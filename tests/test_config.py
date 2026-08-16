@@ -4,7 +4,6 @@ import pytest
 
 from my_agent.config import PROJECT_ROOT, AgentConfig, load_config
 
-
 CONFIG_ENVIRONMENT_VARIABLES = (
     "DEEPSEEK_API_KEY",
     "MODEL_ID",
@@ -90,7 +89,7 @@ def test_load_config_rejects_invalid_log_level(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.parametrize("raw_value", ["true", "1", "yes"])
 def test_load_config_accepts_true_shell_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
+        monkeypatch: pytest.MonkeyPatch, raw_value: str
 ) -> None:
     set_required_environment(monkeypatch)
     monkeypatch.setenv("ALLOW_SHELL", raw_value)
@@ -100,7 +99,7 @@ def test_load_config_accepts_true_shell_values(
 
 @pytest.mark.parametrize("raw_value", ["false", "0", "no"])
 def test_load_config_accepts_false_shell_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
+        monkeypatch: pytest.MonkeyPatch, raw_value: str
 ) -> None:
     set_required_environment(monkeypatch)
     monkeypatch.setenv("ALLOW_SHELL", raw_value)
@@ -108,7 +107,9 @@ def test_load_config_accepts_false_shell_values(
     assert load_config(env_file=None).allow_shell is False
 
 
-def test_load_config_rejects_invalid_shell_value(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_config_rejects_invalid_shell_value(
+        monkeypatch: pytest.MonkeyPatch,
+) -> None:
     set_required_environment(monkeypatch)
     monkeypatch.setenv("ALLOW_SHELL", "sometimes")
 
@@ -117,7 +118,7 @@ def test_load_config_rejects_invalid_shell_value(monkeypatch: pytest.MonkeyPatch
 
 
 def test_load_config_rejects_missing_workspace_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     set_required_environment(monkeypatch)
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "does-not-exist"))
@@ -127,7 +128,7 @@ def test_load_config_rejects_missing_workspace_root(
 
 
 def test_load_config_rejects_file_as_workspace_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     set_required_environment(monkeypatch)
     workspace_file = tmp_path / "workspace.txt"
