@@ -14,6 +14,9 @@ class AgentConfig:
     api_key: str
     model_id: str
     base_url: str
+    request_timeout_seconds: int
+    max_tool_rounds: int
+    temperature: float
     workspace_root: Path
     log_level: str
     allow_shell: bool
@@ -22,6 +25,9 @@ class AgentConfig:
         return {
             "model_id": self.model_id,
             "base_url": self.base_url,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "max_tool_rounds": self.max_tool_rounds,
+            "temperature": self.temperature,
             "workspace_root": str(self.workspace_root),
             "log_level": self.log_level,
             "allow_shell": self.allow_shell,
@@ -47,6 +53,50 @@ def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
         raise ValueError("MODEL_ID is required")
 
     base_url = os.getenv("BASE_URL", "https://api.deepseek.com").strip()
+    if not base_url:
+        raise ValueError("BASE_URL is required")
+
+    raw_request_timeout = os.getenv("REQUEST_TIMEOUT_SECONDS", "60").strip()
+    try:
+        request_timeout_seconds = int(raw_request_timeout)
+    except ValueError:
+        raise ValueError(
+            "REQUEST_TIMEOUT_SECONDS must be an integer greater than 0, "
+            f"got: {raw_request_timeout!r}"
+        ) from None
+    if request_timeout_seconds <= 0:
+        raise ValueError(
+            "REQUEST_TIMEOUT_SECONDS must be greater than 0, "
+            f"got: {raw_request_timeout!r}"
+        )
+
+    raw_max_tool_rounds = os.getenv("MAX_TOOL_ROUNDS", "4").strip()
+    try:
+        max_tool_rounds = int(raw_max_tool_rounds)
+    except ValueError:
+        raise ValueError(
+            "MAX_TOOL_ROUNDS must be an integer between 1 and 10, "
+            f"got: {raw_max_tool_rounds!r}"
+        ) from None
+    if not 1 <= max_tool_rounds <= 10:
+        raise ValueError(
+            "MAX_TOOL_ROUNDS must be between 1 and 10, "
+            f"got: {raw_max_tool_rounds!r}"
+        )
+
+    raw_temperature = os.getenv("TEMPERATURE", "0").strip()
+    try:
+        temperature = float(raw_temperature)
+    except ValueError:
+        raise ValueError(
+            "TEMPERATURE must be a number between 0 and 2, "
+            f"got: {raw_temperature!r}"
+        ) from None
+    if not 0 <= temperature <= 2:
+        raise ValueError(
+            "TEMPERATURE must be between 0 and 2, "
+            f"got: {raw_temperature!r}"
+        )
 
     raw_workspace_root = os.getenv("WORKSPACE_ROOT", "").strip()
     if raw_workspace_root:
@@ -82,6 +132,9 @@ def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
         api_key=api_key,
         model_id=model_id,
         base_url=base_url,
+        request_timeout_seconds=request_timeout_seconds,
+        max_tool_rounds=max_tool_rounds,
+        temperature=temperature,
         workspace_root=workspace_root,
         log_level=log_level,
         allow_shell=allow_shell,
