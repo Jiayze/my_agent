@@ -1,11 +1,12 @@
 import sys
+from pathlib import Path
 
-from my_agent.config import load_config
+from my_agent.config import DEFAULT_ENV_PATH, load_config
 
 
-def main() -> int:
+def main(env_file: str | Path | None = DEFAULT_ENV_PATH) -> int:
     try:
-        config = load_config()
+        config = load_config(env_file=env_file)
     except ValueError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 1

@@ -13,8 +13,11 @@ def test_main_prints_safe_summary_for_valid_configuration(
     monkeypatch.setenv("WORKSPACE_ROOT", str(PROJECT_ROOT))
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.setenv("ALLOW_SHELL", "false")
+    monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("MAX_TOOL_ROUNDS", "4")
+    monkeypatch.setenv("TEMPERATURE", "0")
 
-    exit_code = main_module.main()
+    exit_code = main_module.main(env_file=None)
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -28,10 +31,10 @@ def test_main_prints_safe_summary_for_valid_configuration(
 def test_main_reports_configuration_errors_to_stderr(
         monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # An empty value keeps load_dotenv() from replacing it with a real .env key.
+    # Passing env_file=None keeps load_config() from reading the developer's .env file.
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")
 
-    exit_code = main_module.main()
+    exit_code = main_module.main(env_file=None)
 
     captured = capsys.readouterr()
     assert exit_code == 1
