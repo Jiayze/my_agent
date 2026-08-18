@@ -11,6 +11,9 @@ CONFIG_ENVIRONMENT_VARIABLES = (
     "WORKSPACE_ROOT",
     "LOG_LEVEL",
     "ALLOW_SHELL",
+    "REQUEST_TIMEOUT_SECONDS",
+    "MAX_TOOL_ROUNDS",
+    "TEMPERATURE",
 )
 
 
@@ -29,6 +32,9 @@ def test_load_config_returns_expected_values(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-api-key")
     monkeypatch.setenv("MODEL_ID", "test-model")
     monkeypatch.setenv("BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("MAX_TOOL_ROUNDS", "7")
+    monkeypatch.setenv("TEMPERATURE", "0.5")
     monkeypatch.setenv("WORKSPACE_ROOT", str(workspace_root))
     monkeypatch.setenv("LOG_LEVEL", "debug")
     monkeypatch.setenv("ALLOW_SHELL", "yes")
@@ -39,6 +45,9 @@ def test_load_config_returns_expected_values(monkeypatch: pytest.MonkeyPatch) ->
         api_key="test-api-key",
         model_id="test-model",
         base_url="https://example.invalid/v1",
+        request_timeout_seconds=30,
+        max_tool_rounds=7,
+        temperature=0.5,
         workspace_root=workspace_root.resolve(),
         log_level="DEBUG",
         allow_shell=True,
@@ -55,6 +64,9 @@ def test_load_config_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.workspace_root == PROJECT_ROOT
     assert config.log_level == "INFO"
     assert config.allow_shell is False
+    assert config.request_timeout_seconds == 60
+    assert config.max_tool_rounds == 4
+    assert config.temperature == 0.0
 
 
 def test_load_config_rejects_blank_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,8 +163,14 @@ def test_safe_summary_excludes_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
         "workspace_root",
         "log_level",
         "allow_shell",
+        "request_timeout_seconds",
+        "max_tool_rounds",
+        "temperature",
         "api_key_configured",
     }
     assert api_key not in str(summary)
     assert isinstance(summary["workspace_root"], str)
     assert summary["api_key_configured"] is True
+    assert summary["request_timeout_seconds"] == 60
+    assert summary["max_tool_rounds"] == 4
+    assert summary["temperature"] == 0.0
