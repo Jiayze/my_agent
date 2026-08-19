@@ -1,3 +1,6 @@
+import math
+from numbers import Real
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
@@ -5,9 +8,38 @@ from my_agent.config import AgentConfig
 from my_agent.models import ModelConfigurationError
 
 
-#这个模块只会创建聊天模型对象。它不处理任何对话循环、命令行交互或工具执行。客户端是在 `create_chat_model` 内部懒加载构建的，所以导入这个模块时不会读取真实环境或打开网络连接。
+def _require_non_empty_string(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ModelConfigurationError(f"{name} must be a non-empty string")
+    return value.strip()
 
-#从 `config` 创建一个聊天模型,单独的参数可以被覆盖
+
+def _require_temperature(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ModelConfigurationError(
+            "temperature must be a finite number between 0 and 2"
+        )
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ModelConfigurationError(
+            "temperature must be a finite number between 0 and 2"
+        ) from None
+    if not math.isfinite(normalized) or not 0 <= normalized <= 2:
+        raise ModelConfigurationError(
+            "temperature must be a finite number between 0 and 2"
+        )
+    return normalized
+
+
+def _require_timeout(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ModelConfigurationError(
+            "request_timeout_seconds must be a positive integer"
+        )
+    return value
+
+
 def create_chat_model(
     config: AgentConfig,
     *,
@@ -16,15 +48,19 @@ def create_chat_model(
     api_key: str | None = None,
     temperature: float | None = None,
 ) -> BaseChatModel:
-    effective_model_id = config.model_id if model_id is None else model_id
-    effective_base_url = config.base_url if base_url is None else base_url
-    effective_api_key = config.api_key if api_key is None else api_key
-    effective_temperature = config.temperature if temperature is None else temperature
-
-    if not effective_model_id:
-        raise ModelConfigurationError("MODEL_ID must not be empty")
-    if not effective_base_url:
-        raise ModelConfigurationError("BASE_URL must not be empty")
+    effective_model_id = _require_non_empty_string(
+        "model_id", config.model_id if model_id is None else model_id
+    )
+    effective_base_url = _require_non_empty_string(
+        "base_url", config.base_url if base_url is None else base_url
+    )
+    effective_api_key = _require_non_empty_string(
+        "api_key", config.api_key if api_key is None else api_key
+    )
+    effective_temperature = _require_temperature(
+        config.temperature if temperature is None else temperature
+    )
+    request_timeout_seconds = _require_timeout(config.request_timeout_seconds)
 
     try:
         return ChatOpenAI(
@@ -32,10 +68,9 @@ def create_chat_model(
             model=effective_model_id,
             base_url=effective_base_url,
             temperature=effective_temperature,
-            timeout=config.request_timeout_seconds,
+            timeout=request_timeout_seconds,
         )
-    except Exception as exc:
-        #不要传播原始异常：其文本可能包含API密钥或其他秘密。只保留异常类型名称用于诊断
+    except Exception:
         raise ModelConfigurationError(
-            f"failed to create chat model client: {type(exc).__name__}"
+            "failed to initialize chat model; check model configuration"
         ) from None
