@@ -89,6 +89,7 @@ def test_load_config_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.max_tool_rounds == 4
     assert config.temperature == 0.0
 
+
 def test_load_config_rejects_blank_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(API_KEY_ENV, "   ")
 
@@ -155,7 +156,7 @@ def test_load_config_rejects_invalid_log_level(monkeypatch: pytest.MonkeyPatch) 
     set_api_key(monkeypatch)
     monkeypatch.setenv(LOG_LEVEL_ENV, "verbose")
 
-    with pytest.raises(ValueError, match="log_level should be one of"):
+    with pytest.raises(ValueError, match=r"log_level should be one of.*got: 'verbose'"):
         load_config(env_file=None)
 
 
@@ -185,8 +186,11 @@ def test_load_config_rejects_invalid_shell_value(
     set_api_key(monkeypatch)
     monkeypatch.setenv(ALLOW_SHELL_ENV, "sometimes")
 
-    with pytest.raises(ValueError, match="ALLOW_SHELL must be one of"):
+    with pytest.raises(
+        ValueError, match=r"ALLOW_SHELL must be one of.*got: 'sometimes'"
+    ):
         load_config(env_file=None)
+
 
 def test_load_config_rejects_missing_workspace_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

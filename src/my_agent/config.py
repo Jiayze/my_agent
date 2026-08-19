@@ -80,8 +80,7 @@ def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
         ) from None
     if not 1 <= max_tool_rounds <= 10:
         raise ValueError(
-            "MAX_TOOL_ROUNDS must be between 1 and 10, "
-            f"got: {raw_max_tool_rounds!r}"
+            f"MAX_TOOL_ROUNDS must be between 1 and 10, got: {raw_max_tool_rounds!r}"
         )
 
     raw_temperature = os.getenv("TEMPERATURE", "0").strip()
@@ -89,13 +88,11 @@ def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
         temperature = float(raw_temperature)
     except ValueError:
         raise ValueError(
-            "TEMPERATURE must be a number between 0 and 2, "
-            f"got: {raw_temperature!r}"
+            f"TEMPERATURE must be a number between 0 and 2, got: {raw_temperature!r}"
         ) from None
     if not 0 <= temperature <= 2:
         raise ValueError(
-            "TEMPERATURE must be between 0 and 2, "
-            f"got: {raw_temperature!r}"
+            f"TEMPERATURE must be between 0 and 2, got: {raw_temperature!r}"
         )
 
     raw_workspace_root = os.getenv("WORKSPACE_ROOT", "").strip()
@@ -104,18 +101,17 @@ def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
     else:
         workspace_root = PROJECT_ROOT
     if not workspace_root.exists():
-        raise ValueError(
-            f"WORKSPACE_ROOT does not exist: {workspace_root}"
-        )
+        raise ValueError(f"WORKSPACE_ROOT does not exist: {workspace_root}")
     if not workspace_root.is_dir():
-        raise ValueError(
-            f"WORKSPACE_ROOT is not a directory: {workspace_root}"
-        )
+        raise ValueError(f"WORKSPACE_ROOT is not a directory: {workspace_root}")
 
-    log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    raw_log_level = os.getenv("LOG_LEVEL", "INFO").strip()
+    log_level = raw_log_level.upper()
     if log_level not in VALID_LOG_LEVELS:
         raise ValueError(
-            "log_level should be one of 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'"
+            "log_level should be one of "
+            "'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', "
+            f"got: {raw_log_level!r}"
         )
 
     raw_allow_shell = os.getenv("ALLOW_SHELL", "false").strip().lower()
@@ -125,7 +121,8 @@ def load_config(env_file: str | Path | None = DEFAULT_ENV_PATH) -> AgentConfig:
         allow_shell = False
     else:
         raise ValueError(
-            "ALLOW_SHELL must be one of: true, false, 1, 0, yes, no"
+            "ALLOW_SHELL must be one of: true, false, 1, 0, yes, no, "
+            f"got: {raw_allow_shell!r}"
         )
 
     return AgentConfig(
