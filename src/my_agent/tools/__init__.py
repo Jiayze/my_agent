@@ -1,5 +1,6 @@
 """my_agent 公共工具接口。"""
 
+from my_agent.tools.builtin import add_numbers
 from my_agent.tools.registry import (
     DuplicateToolNameError,
     ToolRegistry,
@@ -12,4 +13,5 @@ __all__ = [
     "ToolRegistry",
     "ToolRegistryError",
     "UnknownToolError",
+    "add_numbers",
 ]

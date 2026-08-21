@@ -49,6 +49,8 @@ class ToolRegistry:
 
     def get_tool(self, name: str) -> BaseTool:
         """按名称查找工具；未注册名称抛出 UnknownToolError。"""
+        if not isinstance(name, str):
+            raise UnknownToolError(f"unknown tool: {name!r}")
         try:
             return self._by_name[name]
         except KeyError:
