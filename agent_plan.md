@@ -1,4 +1,4 @@
-# my_agent Agent 框架增量开发计划（修订版）
+# my_agent Agent 框架增量开发计划（源码复核修订版）
 
 ## 0. 本次修订已确认的决策
 
@@ -7,7 +7,7 @@
 1. **单用户系统**：不引入多租户、登录和权限隔离。
 2. **短期记忆按对话隔离**：短期记忆的设计归属键是 `conversation_id`，最终与对话发生在 CLI、QQ、桌面还是其他端无关；实现按第 14 条分阶段推进。
 3. **长期记忆全局统一**：跨端共享同一个逻辑记忆库，第一版不实现，但架构上必须预留唯一入口。记忆分规则层、常驻层、历史召回层；外部内容只当 data，不能直接变成 instruction。
-4. **Agent 是无状态执行核心**：`Agent.invoke(messages, *, run_context=None)` 只做"消息序列 + 本次调用上下文 → 结果"，不保存历史。`run_context` 只提供本轮 run_id、取消信号和可选事件接收器，调用结束即丢弃，不能成为对话记忆或跨轮状态。
+4. **Agent 是无状态执行核心**：`Agent.invoke(messages, *, run_context=None)` 只做"消息序列 + 本次调用上下文 → 结果"，不保存历史。`run_context` 携带本轮 `run_id`、可选 `conversation_id` 以及未来的取消信号/事件接收器，调用结束即丢弃，不能成为对话记忆或跨轮状态；V0.1 不宣称后两者已经生效。
 5. **Conversation 持有短期记忆**：每个对话一个 `Conversation`，系统提示词只注入一次，上下文压缩只发生在这一层。
 6. **TOTP 动态验证码**：所有 `/command ` 统一进入认证状态机；TOTP 采用 RFC 6238，兼容 Google Authenticator 等验证器。威胁模型是"QQ 账号被盗 / 消息伪造 / 模型诱导"，不覆盖实体手机丢失和主机已被攻破；重放、限流、过期必须实现。成功输码后进入 10 分钟免输码窗口（`TOTP_GRACE_MINUTES` 默认 10，可设 0 关闭）。免输码窗口绑定 `(credential_id, transport, channel_id, verified_source_id, command_session_id)`，其中 session ID 只能由 CLI、QQ、SSH、桌面等可信适配器生成；一个端或连接输码不能让另一个端或连接免码。窗口自最近一次成功输码起算，不因免码执行续期；窗口内的命令没有再次证明来自验证器持有人，这是为便利性明确接受的剩余风险，严格模式可配置为 0。
 7. **Agent 永久禁止清单**：任意 Shell、`git commit/push/reset/revert`、删除文件、修改系统配置、写工作目录之外的文件。这些操作不注册为 Agent 工具；Agent 只能输出惰性建议文本，由用户自行复制并通过 `/command ` 执行。
@@ -20,8 +20,44 @@
 14. **短期记忆实现分阶段**：V0.1 历史只存在于 `Conversation` 实例内，`conversation_id` 是身份与隔离键；跨端阶段通过 `ConversationStore` 按 id 加载/保存，同一 id 的写入必须串行化。
 15. **长期记忆是逻辑唯一存储**：CLI、QQ、桌面可能在不同进程，不共享进程内单例；全局只有一个逻辑长期记忆库，各适配器连接同一个 `LongTermMemoryStore` 后端，每个进程可有自己的客户端实例。记忆不是 append-only：必须支持来源、证据、置信度、作用域、过期、更新、删除和审计；未验证结论、一次性 workaround、敏感信息和外部网页/文件/消息中的指令默认不写入。
 16. **副作用先记账、后执行、崩溃不自动重试**：所有写文件、执行命令等有副作用的操作，执行前先创建并持久化 intent 记录（请求 ID、参数、状态、预分配 snapshot_id）；文件快照在 intent 之后生成并标记 `snapshot_ready`，再进入 `executing`。崩溃恢复时：只有进入 `executing` 之前的 intent 可以安全丢弃（并清理其未完成快照）；任何 `executing` 都标记结果未知并通知用户人工检查；永远不自动重试非幂等副作用操作。文件写入可基于快照回滚；命令执行默认不自动回滚，由用户决定如何处理。
-17. **进度账本防卡死（V0.3 落地）**：V0.1 先用 `max_tool_rounds`、`recursion_limit` 和模型请求超时防卡死，不实现完整进度账本。V0.3 与只读工具一起实现 `progress_log` 和 `AgentStallError`；契约提前锁定：卡死签名只由规范化后的工具名、参数摘要、结果摘要组成，不包含轮次、时间戳、调用 ID、随机 ID 等每轮变化字段，并行工具调用先排序再规范化。
+17. **进度账本防卡死（V0.3 落地）**：V0.1 先用 `max_tool_rounds`、`recursion_limit` 和模型请求超时防卡死，不实现完整进度账本。V0.3 与只读工具一起实现 `progress_log`；检测到卡死时返回 `AgentResult(error_code="agent_stall")`。契约提前锁定：卡死签名只由规范化后的工具名、参数摘要、结果摘要组成，不包含轮次、时间戳、调用 ID、随机 ID 等每轮变化字段，并行工具调用先排序再规范化。
 18. **SSH 是第二管理通道**：SSH/Tailscale 适配器作为 QQ 的可靠备用通道，复用同一个 `Conversation`、`CommandRequest` 和 TOTP 状态机；SSH 只暴露 forced command 最小协议，不直接给完整 shell，也不给 Agent 任何 SSH 能力。
+
+### 0.1 外部源码复核后固定的工程规则
+
+以下规则来自已阅读的具体源码和测试，不把任何一个大型项目当作当前项目的完整模板：
+
+- Hermes（`999703fd43ab6d75c4a5c7bc8b610dd73ecece76`）在工具边界把普通工具异常转换为工具错误结果，同时使用 `logger.exception()` 保留 traceback；它还会为未闭合的工具调用补齐结果，并测试并行工具结果和中断历史。
+- AutoGPT（`65e80c71591461d77b19fe64c939dd768ab455ef`）的 action history 先保存原始 assistant tool-call，再为每个并行 tool-call 生成一个 result；工具错误作为结构化 action result，不是孤儿 tool message。它的历史模型不是当前 LangChain 消息历史，不能直接照搬。
+- deepseek-harness（`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`）在模型调用前追加 `user/message`，以事件日志保存 `tool/call` 和 `tool/result`；取消时为已开始或未开始的调用写入可回放结果；工具业务失败可以是 `isError`，调度器内部错误仍然抛出。
+- 当前依赖 LangGraph 1.2.11 的 `ToolNode` 会按 handler 类型注解推断 `handle_tool_errors` 捕获范围；`GraphBubbleUp` 会在 `ToolNode` 内部重新抛出；同步并行工具结果只有在执行器完成结果收集后才组合为节点输出。上述事实不能被简化为“所有异常都应 raise”或“所有异常都应吞掉”。
+
+由这些源码事实固定以下 V0.1 规则：
+
+1. **用户安全输出与开发者诊断分离**：预期的模型/工具/外部服务失败可以返回安全的 `AgentResult` 或 `ToolMessage`；如果失败由异常触发，必须记录结构化上下文和 traceback，参数校验/未知工具等无异常路径至少记录可检索的 warning 或 reason。不得用 `del error` 让失败不可诊断。日志必须脱敏，不把 API key、完整提示词、敏感参数或原始异常文本直接交给模型。
+2. **业务失败与框架控制流分离**：工具业务失败、参数校验失败和未知工具可以转成 `ToolMessage(status="error")`；`GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、取消异常和图调度器错误不得伪装成普通工具失败。`GraphRecursionError` 使用独立错误码。
+3. **工具消息协议不变量**：保留触发调用的 `AIMessage(tool_calls=...)`；每个 `tool_call_id` 最多一个对应结果；不能留下孤儿 `ToolMessage`，也不能留下未闭合的 tool-call。合成的未执行/失败结果必须明确标记为错误或未开始，不能默认标记为成功。
+4. **部分执行状态必须诚实**：没有耐久执行记录时，不得声称某个工具“未执行”或“已成功”；并行工具发生取消、调度器错误或进程中断时，只能保留已确认的结果，对未知结果使用独立的中断/未知状态。副作用工具在 V0.4/V0.6 前不得实现。
+5. **取消不是普通失败**：输入阶段 Ctrl+C 的语义可以是退出；模型/工具执行阶段的 Ctrl+C 或 `CancelledError` 是取消当前轮，并必须定义用户消息和部分结果的提交语义。未实现取消时，接口不得把 `cancel_signal` 描述成可用能力。
+6. **证据边界**：本地 LangChain 转换器没有证明 provider 服务端一定拒绝某种消息序列；计划只锁定可由本地消息模型和测试验证的顺序不变量，不把未核实的 provider 行为写成事实。
+7. **适用范围控制**：事件溯源、租约、fencing token、TOTP 和多端去重是后续阶段的设计参考；不得因为参考项目存在这些机制，就提前把它们引入 V0.1。
+
+### 0.2 V0.1 错误边界矩阵
+
+实现和测试按下面的边界判断，不按“异常越少越好”或“异常越多越好”判断：
+
+| 发生位置 | 例子 | Agent/工具层行为 | CLI/适配器行为 |
+| --- | --- | --- | --- |
+| 配置/启动边界 | 缺少 API key、客户端初始化失败 | 抛出或保留 `ModelConfigurationError` 这类启动错误；记录 cause | 打印安全诊断并以退出码 1 结束 |
+| 工具业务边界 | 参数校验、未知工具、网络/IO/第三方服务失败 | 记录工具上下文；返回唯一的 `ToolMessage(status="error")`，让模型继续 | 通常显示模型生成的解释；若图以 `tool_error` 结束则显示安全失败文本 |
+| 模型预期失败 | API 超时、认证/服务端错误、空最终响应 | 返回 `AgentResult(error_code="model_error" / "empty_model_response")`；记录 traceback；不把底层异常文本放进消息 | 显示安全失败并继续下一轮 |
+| 业务上限 | 工具轮数达到 `max_tool_rounds` | 闭合已产生的 tool-call，返回 `error_code="tool_round_limit"` | 显示达到上限并继续 |
+| 框架硬保险 | `GraphRecursionError` | 返回 `error_code="recursion_limit"`，记录 traceback | 显示安全失败并继续或结束当前适配器任务 |
+| 用户取消 | 执行阶段 `KeyboardInterrupt`、`CancelledError` 或已实现的取消信号 | 返回 `error_code="cancelled"` 或按上层取消协议传播；不转成 `tool_error` | 报告本轮取消，保留已确认状态并回到输入循环 |
+| LangGraph 控制流 | `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained` | 保持控制流语义，不由工具 handler 吞掉；按实际根图 API 传播/转换 | 由单轮边界决定继续、暂停或结束 |
+| 未预期编程/调度器错误 | `NameError`、状态 reducer 错误、executor 崩溃 | `logger.exception()` 记录完整 traceback；不伪装成业务 `ToolMessage`，传播到单轮边界 | 显示固定安全错误；是否继续由 CLI 的明确策略决定 |
+
+工具 handler 的 `except Exception` 只覆盖工具业务边界，并且必须位于控制流异常已排除的边界之后；不在多个层级重复包装同一异常。预期失败的“返回”与未预期错误的“传播”都是契约的一部分。
 
 ---
 
@@ -41,7 +77,7 @@
 
 ## 2. 当前项目判断
 
-现有结构适合继续开发，不需要推倒重来：
+本次重构从 M3 完成点开始：配置、模型工厂和最小工具系统已经存在；旧 M4 实现已移除，当前工作区正在按本计划重新实现 M4。此处记录重构起点与当前进度，不能把旧 M4 代码当作已验证成果：
 
 ```text
 my_agent/
@@ -53,33 +89,41 @@ my_agent/
 │       ├── __init__.py
 │       ├── config.py
 │       ├── llm.py
-│       ├── agent.py
+│       ├── agent.py              # M4 无状态执行核心
 │       ├── main.py
+│       ├── models.py
+│       ├── prompts.py
+│       ├── conversation.py       # M4 对话短期记忆
 │       └── tools/
-│           └── __init__.py
+│           ├── __init__.py
+│           ├── registry.py
+│           └── builtin.py
 └── tests/
     ├── test_config.py
+    ├── test_llm.py
+    ├── test_tools.py
+    ├── test_agent.py
+    ├── test_conversation.py
     └── test_main.py
 ```
 
-当前已经完成：
+当前代码已经完成（M3）：
 
 - 使用 `.env` 加载模型、工作目录、日志级别和 Shell 开关。
-- 对必填配置和布尔值进行基本校验。
+- 对必填配置、布尔值、超时、温度和工具轮数进行校验。
 - `safe_summary()` 不会泄露 API key。
-- `main()` 能报告配置错误并返回明确退出码。
-- 配置层和启动层已有基础测试（当前 `18 passed`）。
+- `main()` 仍负责加载配置并输出安全摘要；CLI 交互式组装属于 M6，尚未开始。
+- `ToolRegistry` 和无副作用演示工具已经完成，M3 工具测试保留。
+- M3 之后的旧 M4 实现已从工作区移除；本次重构已重新实现 M4 的 Agent、Conversation、结构化失败结果和基础离线测试。当前测试基线为 `75 passed, 2 skipped`，每次后续重构都必须重新运行。
 
-当前真正缺少：
+M4 当前已实现，仍需在 M5 补齐：
 
-- `llm.py` 没有模型客户端。
-- `agent.py` 没有 Agent 状态和执行图。
-- 没有 `Conversation`，短期记忆无处归属。
-- `tools` 没有工具协议、注册表和具体工具。
-- `main.py` 只是配置检查，不是交互式入口。
-- `pyproject.toml` 没有 Agent 依赖、构建配置和命令行脚本。
+- 实现无状态 `Agent` 和 `Conversation`，不提前引入存储层或适配器层。
+- 将预期运行失败统一收敛到 `AgentResult.error_code`，同时保留控制流和未预期调度器错误的边界。
+- 实现完整的 AI tool-call / ToolMessage 协议闭合、工具轮数上限和默认按完整轮次截断。
+- 已建立基础离线假模型测试；M5 继续补齐控制流异常、取消、日志脱敏、并行部分失败和再次调用协议测试。
 
-正确路线是填充现有空模块，新增 `conversation.py` 等少量职责明确的文件。
+正确路线是先按本计划冻结错误、消息和取消契约，再在现有模块边界内做小范围重构；不为解决 V0.1 问题提前创建 `storage/`、`adapters/` 或事件溯源目录。
 
 ## 3. 第一版范围
 
@@ -259,7 +303,7 @@ def create_chat_model(config: AgentConfig) -> BaseChatModel:
 
 不要在模块导入时创建客户端，避免测试导入时读取真实环境或建立网络连接。
 
-无效配置在工厂初始化时转换为领域错误 `ModelConfigurationError`，不把底层异常对象直接抛给上层。BASE_URL 只做非空检查，可用性留给模型客户端初始化和真实连接阶段暴露，不猜测兼容服务的 URL 语义。
+`AgentConfig` 已经保证的字段不在 `llm.py` 重复校验；只有显式 override 参数属于本模块的新输入边界，才在这里校验。工厂初始化失败转换为 `ModelConfigurationError`，用户可见文本不暴露底层细节，但原始异常必须通过 logger 保留给开发者，不能用 `from None` 同时丢掉 cause 和日志。BASE_URL 只做非空检查，可用性留给模型客户端初始化和真实连接阶段暴露，不猜测兼容服务的 URL 语义。
 
 工厂应预留参数覆盖能力（model_id / base_url / api_key / temperature），V0.2 摘要模型直接复用，不复制一套客户端代码。
 
@@ -269,7 +313,7 @@ def create_chat_model(config: AgentConfig) -> BaseChatModel:
 - 验证配置字段被正确传递。
 - 验证测试中没有真实 HTTP 请求。
 - 验证导入 `my_agent.llm` 不读 `.env`、不建网络连接。
-- 验证 API key 不出现在异常和日志中。
+- 验证 API key 不出现在用户异常和日志中；同时验证初始化失败有可供开发者定位的记录。
 
 ### M2.3 手动 smoke test
 
@@ -343,6 +387,7 @@ class AgentResult:
     reply: str
     messages: tuple[BaseMessage, ...]   # 不可变，避免 frozen dataclass 持有可变 list
     tool_rounds: int
+    error_code: str | None = None
 
 class Agent:
     def __init__(self, model: BaseChatModel, tools: Sequence[BaseTool], max_tool_rounds: int):
@@ -360,12 +405,13 @@ class Agent:
 规则：
 
 - `Agent` 不保存任何对话历史，只接收完整消息序列并返回结果。
-- `AgentRunContext` 是不可变的单次调用对象，最小字段为 `run_id`、可选 `conversation_id`、可选 `event_sink` 和取消信号；Agent 和图编译结果都不得把它保存到实例字段。V0.1 默认传 `None`，V0.6 才启用持久事件接收器，因此第一版不依赖存储层。
+- `AgentRunContext` 是不可变的单次调用对象。V0.1 只承诺 `run_id` 和可选 `conversation_id` 可用于日志关联；`event_sink` 和 `cancel_signal` 在 V0.1 必须为空或被明确标记为未启用，不能让调用方误以为取消/事件已经生效。Agent 和图编译结果都不得把 context 保存到实例字段。V0.6 持久化会话启用事件接收器和取消信号后，必须补齐真实消费逻辑和行为测试。
 - `Agent` 不读取 `.env`，不打印回复，不处理 CLI/QQ/GUI，不直接执行工具之外的副作用。
 - 构造时接收裸 `BaseChatModel`，并在构造或图构建时执行一次 `self._bound_model = model.bind_tools(tools)`；模型节点只调用已绑定的模型，不重复执行 `bind_tools()`。
-- 执行开始后的所有失败统一抛 `AgentRunError` 子类：`ModelError`、`EmptyModelResponseError`、`ToolRoundLimitError`、`AgentExecutionError`（V0.3 后新增 `AgentStallError`）。`AgentRunError` 必须携带 `messages: tuple[BaseMessage, ...]` 和 `safe_message: str`；`messages` 是异常发生时的**完整、协议有效状态**——每个 `tool_call_id` 都有对应 `ToolMessage`，绝不允许悬空 tool_calls。异常状态本身不预先追加 `safe_message`，由 `Conversation` 统一追加且只追加一次。语义与成功路径的 `AgentResult.messages` 一致，都是"执行后的完整状态"，避免 `Conversation` 把完整历史再次追加到旧历史。异常类先定义在 `agent.py` 内，两个以上模块共用时再集中。
-- `AgentResult.messages` 是本次执行后的完整消息序列（tuple），供 `Conversation` 更新历史；`reply` 是给用户的自然语言答案。
-- **模型响应规范化**：`AIMessage(content="", tool_calls=[...])` 是合法工具请求，不能因为 `content` 为空而抛错；只有响应不含 tool_calls，且从字符串或内容块列表规范化提取后的最终文本仍为空时，才抛 `EmptyModelResponseError`。无效的空最终 AIMessage 不写入 `AgentRunError.messages`，错误状态回退到该模型调用前，再由 `Conversation` 追加唯一的安全 AI 消息。`AgentResult.reply` 只保存规范化后的最终文本字符串。
+- **失败契约不再使用 `AgentRunError` 层级**：V0.1 的可预期运行失败通过 `AgentResult.error_code` 返回，至少包括 `model_error`、`empty_model_response`、`tool_error`、`tool_round_limit`、`recursion_limit`、`cancelled` 和 `execution_error`。`reply` 是安全的用户可见文本；`messages` 是截至当前边界已确认的、可再次交给消息转换器的消息状态，不声称包含节点内部尚未提交的部分工具结果。
+- Agent 只在明确的模型调用失败、空响应、工具业务失败、业务轮数限制和已识别的取消/递归限制等预期路径返回 `AgentResult`。`GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、取消异常和未预期的图/调度器编程错误不得转换为普通 `tool_error`；可识别的取消/递归路径返回对应 `error_code`，无法安全归类的异常必须先记录日志，再传播到 CLI 的单轮边界。CLI 可以在单轮边界捕获并继续，但不应在 Agent 内伪装成工具结果。
+- `AgentResult.messages` 是本次执行后可确认的消息序列（tuple），供 `Conversation` 更新历史；`reply` 是给用户的自然语言答案。错误结果必须保留触发调用的 `AIMessage(tool_calls=...)`，并为每个尚未有结果的 `tool_call_id` 至多补一个合成 `ToolMessage(status="error")` 或 `status="error"` 且带明确未开始/取消语义的结果。
+- **模型响应规范化**：`AIMessage(content="", tool_calls=[...])` 是合法工具请求，不能因为 `content` 为空而返回空回复错误；只有响应不含 tool_calls，且从字符串或内容块列表规范化提取后的最终文本仍为空时，才返回 `empty_model_response`。无效的空最终 AIMessage 不写入结果消息，错误状态回退到该模型调用前，再追加唯一的安全 AIMessage。
 
 ### 9.2 Conversation 持有短期记忆
 
@@ -380,7 +426,7 @@ class Conversation:
     ):
         ...
 
-    def send(self, user_message: str) -> str:
+    def send(self, user_message: str) -> AgentResult:
         ...
 
     @property
@@ -391,16 +437,20 @@ class Conversation:
 规则：
 
 - V0.1 中历史只存在于 `Conversation` 实例内，`conversation_id` 是身份和隔离键；相同 id 的两个新实例不会自动共享历史。进程崩溃会丢失内存中的对话历史，这是第一版明确接受的：此时没有副作用工具，不存在数据破坏；真正的断点续接从 V0.6 `ConversationStore` 开始。跨端阶段再引入 `ConversationStore`，按 id 加载/保存状态，同一 id 的 `send` 必须串行化。
+- `send()` 返回本轮的 `AgentResult`，由 CLI/适配器显示 `result.reply`，并可根据 `result.error_code` 区分预期失败；不能把失败状态降格成只有一段字符串。
 - 系统提示词只在创建会话时注入一次；后续 `send()` 不再重复追加。
-- 每个"用户消息 → 工具链 → 最终回复"是一个**不可交错的逻辑轮次**，不是数据库事务意义上的全成功或全回滚：失败时保留已经完成的工具事实，再用安全 AI 消息闭合本轮。
+- 每个"用户消息 → 工具链 → 最终回复"是一个**不可交错的逻辑轮次**，不是数据库事务意义上的全成功或全回滚。V0.1 无副作用工具时，正常工具错误保留为 `ToolMessage(status="error")` 并允许模型继续；模型失败、取消或图异常时只保存已确认且协议有效的状态，并明确记录 `error_code`。不得在没有执行记录时声称工具已成功或一定未执行。
 - 压缩/截断只发生在轮次边界，系统提示词永远保留、不参与压缩。
-- `Agent.invoke` 抛 `AgentRunError` 时：用完整状态替换历史，即 `self._messages = error.messages + (AIMessage(content=error.safe_message),)`，而不是把 `error.messages` 追加到旧历史之后；更新历史后重新抛出同一个错误，由 CLI/适配器显示 `safe_message`。`safe_message` 不含 traceback、API key 或内部对象表示。不允许丢弃已经发生的工具事实，避免未来重复执行有副作用的工具。
+- 用户消息提交和 Agent 执行结果提交必须有明确边界：`send()` 在压缩和 Agent 调用前先把本轮 `HumanMessage` 作为 pending 事实提交到会话状态；收到 `AgentResult` 后，只有通过协议校验的 `result.messages` 才能替换可见历史，并确保本轮用户消息没有丢失。取消、`KeyboardInterrupt`、`asyncio.CancelledError`、compactor 异常或 Agent 未返回结果时，至少保留 pending 用户消息；没有耐久执行记录时不合成“已执行/未执行”的工具结果。V0.6 事件日志落地前，不声称具备崩溃恢复或副作用执行事实。
+- 失败历史可以保留已确认的工具事实；`error_code` 和安全 `reply` 是结果状态，默认不把安全失败文本追加成普通成功 `AIMessage`。如果为了闭合已经产生的 tool-call 必须合成消息，必须带明确的错误/取消元数据。历史提交后再次调用模型时，必须先通过离线消息协议测试。
 - `context_compactor` 为 `None` 时使用第一版默认策略：硬截断兜底。截断单位是**完整轮次**，不是消息条数：保留静态系统提示词 + 截断提示 + 最近 N 个完整 `ConversationTurn`。一个完整轮次包括 `HumanMessage` + `AIMessage(tool_calls)` + `ToolMessage...` + `AIMessage(final reply)`；按消息条数截断可能留下 `ToolMessage` 却删除对应 `tool_calls`，禁止使用。默认常量在实现时确定并配测试；V0.2 用 token 级摘要压缩替换默认策略。
 
 `ContextCompactor` 第一版只定义协议：
 
 ```python
 class ContextCompactor(Protocol):
+    """返回仍可交给模型的消息；必须保留首条 system prompt 和完整 tool-call/result 配对。"""
+
     def compact(self, messages: tuple[BaseMessage, ...]) -> tuple[BaseMessage, ...]:
         ...
 ```
@@ -434,24 +484,25 @@ model
 - 模型节点只负责：读取状态消息、调用已绑定工具的模型、追加模型消息；不直接执行工具。
 - `tools` 节点使用 LangGraph 自带 `ToolNode`，只执行工具并返回工具消息，不手写工具调用 JSON 解析器。
 - `increment_tool_rounds` 是独立节点，只负责把 `tool_rounds` 加 1，不做其他事情。
-- `close_unexecuted_tools` 是独立节点：为最后一条 AIMessage 中每个未执行的 tool call 追加带原 `tool_call_id` 的安全 `ToolMessage`，并设置 `terminal_error = "tool_round_limit"`。条件边只选择节点，不在路由函数中修改状态。
+- `close_unexecuted_tools` 是独立节点：为最后一条 AIMessage 中每个没有结果的 tool call 追加带原 `tool_call_id`、`status="error"` 和“未执行/达到上限”语义的安全 `ToolMessage`，按 `tool_call_id` 去重，并设置 `terminal_error = "tool_round_limit"`。条件边只选择节点，不在路由函数中修改状态。
 
 ### 9.4 工具轮数定义（必须写死）
 
 - 一次进入 `ToolNode` 算一轮。
 - 同一次模型响应并行调用多个工具，仍只算一轮。
 - `tool_rounds` 初始为 0；原生 `ToolNode` 不负责修改该字段，由独立 `increment_tool_rounds` 节点在 `tools` 之后固定递增一次（不在模型节点、不在条件边里递增）。工具返回业务错误 `ToolMessage` 也算一轮。
-- `ToolNode` 自身崩溃导致本轮没有正常结束时，不计入轮数，作为 Agent 级异常处理。
+- `ToolNode` 自身崩溃导致本轮没有正常结束时，不计入轮数，作为 Agent/控制流异常处理；不能仅凭缺少结果消息判断工具没有执行。
 - 模型再次返回 `tool_calls` 时，条件边先检查 `tool_rounds >= max_tool_rounds`：
   - 未到上限：进入工具节点。
-  - 已到上限：路由到 `close_unexecuted_tools`，由该节点补齐消息并结束图；`Agent.invoke` 发现 `terminal_error == "tool_round_limit"` 后抛 `ToolRoundLimitError`，其 `messages` 必须是上述闭合后的完整状态，由 CLI/适配器转换为用户可读信息。
-- `recursion_limit` 只作为框架失控时的硬保险，不替代业务计数。初始值参考 `max(25, 2 * max_tool_rounds + 5)`，必须在 M4 用实际安装的 LangGraph 步数验证并调整，不把公式当承诺。
+  - 已到上限：路由到 `close_unexecuted_tools`，由该节点补齐消息并结束图；`Agent.invoke` 发现 `terminal_error == "tool_round_limit"` 后返回 `AgentResult(error_code="tool_round_limit")`，其 `messages` 必须是上述闭合后的完整状态，由 CLI/适配器转换为用户可读信息。
+  - `recursion_limit` 只作为框架失控时的硬保险，不替代业务计数。初始值参考 `max(25, 3 * max_tool_rounds + 5)`，必须在 M4 用实际安装的 LangGraph 步数验证并调整，不把公式当承诺；触发 `GraphRecursionError` 时使用独立 `recursion_limit` 状态，不伪装成工具失败。
 
 ### 9.5 工具错误处理
 
-- `ToolNode` 的错误处理参数以安装版本 API 为准（按实际版本确认 `handle_tool_errors` 等参数名，不复制旧示例）。
-- 参数缺失、参数类型错误、工具业务失败、未知工具：转换为安全的 `ToolMessage`，让模型有机会向用户解释失败。未知工具必须使用原 `tool_call_id` 回填"该工具未注册"，让模型继续生成自然语言回复；任何保留下来的历史中不得出现悬空的 `tool_call_id`。
-- 模型调用失败、空输出、轮数超限，以及连安全 `ToolMessage` 都无法生成的情况：转换为领域异常，由 CLI/适配器处理。
+- `ToolNode` 的错误处理参数以安装版本 API 为准（按实际版本确认 `handle_tool_errors` 等参数名，不复制旧示例）。当前版本的 callable handler 注解为 `Exception` 会捕获所有普通异常，因此 handler 必须记录工具名、`tool_call_id` 和 traceback，再返回脱敏的错误文本；不能静默 `del error`。
+- 参数缺失、参数类型错误、工具业务失败、未知工具：转换为安全的 `ToolMessage(status="error")`，让模型有机会向用户解释失败。未知工具必须使用原 `tool_call_id` 回填“该工具未注册”，让模型继续生成自然语言回复；任何保留下来的历史中不得出现悬空或重复的 `tool_call_id`。
+- `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、取消异常和工具调度器错误不属于普通工具业务失败，不得由 `_tools_node_fn` 的宽泛 `except Exception` 伪装成 `ToolMessage`。需要在实际 LangGraph 版本中用测试确认它们的根图传播路径。
+- 模型调用失败、空输出、轮数超限和 `GraphRecursionError` 可以转换为带 `error_code` 的安全结果；未预期的 Agent/图编程错误必须先记录 traceback，再由上层单轮边界决定是否继续，不在 Agent 内伪造正常 assistant 回复。
 - 空输出只指"不含 tool_calls 且规范化最终文本为空"；含 tool_calls 的空字符串 content 必须继续进入工具节点。最终文本提取同时覆盖字符串 content 和内容块列表。
 - 用户可见输出中不得出现 traceback、API key 或内部对象表示。
 - 设计原则：正常错误路径根本不把底层异常文本和配置对象直接输出；密钥替换/日志过滤只是最后一道保险，不是主要防线。
@@ -473,13 +524,13 @@ model
 - 普通问题可以直接回答。
 - 数学问题可以触发 `add_numbers` 并返回结果。
 - 工具调用后模型能生成最终自然语言回复。
-- 达到循环限制时抛出 `ToolRoundLimitError`，不无限循环；轮数由独立计数节点维护。
+- 达到循环限制时返回 `error_code="tool_round_limit"`，不无限循环；轮数由独立计数节点维护。
 - 工具轮数超限通过 `close_unexecuted_tools` 节点闭合消息链，条件路由函数不修改状态。
 - `bind_tools()` 只在 Agent 构造时执行一次。
 - 同一 `Agent` 实例连续处理不同 `Conversation` 的消息序列，状态不串线。
-- `AgentRunContext` 只在一次调用内可见，调用结束后 Agent 实例不保留 run_id、conversation_id、event_sink 或取消信号引用。
+- `AgentRunContext` 在 V0.1 只作为调用级配置传递；在取消/事件功能尚未实现前，文档不得声称 `cancel_signal` 或 `event_sink` 已生效。调用结束后 Agent 实例不保留 run_id、conversation_id、event_sink 或取消信号引用。
 - 系统提示词在一个 `Conversation` 中只出现一次。
-- 硬截断按完整轮次进行，不切断工具链。
+- 硬截断按完整轮次进行，不切断工具链；自定义 compactor 也必须经过消息协议校验。
 - Agent 核心不依赖 stdin、stdout、`.env`、QQ 或 GUI。
 
 ## 10. 里程碑 M5：Agent 与 Conversation 离线测试
@@ -504,19 +555,23 @@ model
 - 最终只向调用者返回自然语言答案。
 - 一次模型响应并行调用多个工具只计一轮。
 
-### M5.3 异常场景
+### M5.3 异常、取消和消息协议场景
 
 覆盖：
 
 - 空用户输入。
-- 工具参数错误、类型错误、业务异常 → 转为安全 `ToolMessage`。
+- 工具参数错误、类型错误、业务异常 → 转为 `ToolMessage(status="error")`，并验证日志保留 traceback、用户/模型可见文本不泄露敏感信息。
 - 未注册工具。
-- 模型调用抛出异常。
+- 模型 API 的预期异常返回 `error_code="model_error"`；未预期的模型/Agent 编程异常先记录 traceback，再传播到单轮边界。
 - 模型返回不含 tool_calls 的空最终内容。
-- 工具调用轮数超限：每个未执行的 tool_call 都先获得带原 `tool_call_id` 的安全 `ToolMessage`，错误状态中不存在悬空 tool_calls。
-- `AIMessage(content="", tool_calls=[...])` 正常进入工具节点；只有无 tool_calls 的空最终响应触发 `EmptyModelResponseError`。
+- 工具调用轮数超限：每个未执行的 tool_call 都先获得带原 `tool_call_id`、`status="error"` 的安全 `ToolMessage`，错误状态中不存在悬空或重复 tool_calls。
+- `AIMessage(content="", tool_calls=[...])` 正常进入工具节点；只有无 tool_calls 的空最终响应返回 `error_code="empty_model_response"`。
 - 最终响应为内容块列表时能够提取文本并返回稳定的 `str`，没有文本块时按空最终响应处理。
 - 用户可见错误不包含 API key、完整 traceback 或内部细节。
+- 一个并行工具成功、另一个普通工具异常时，验证每个 `tool_call_id` 都有唯一结果，且下一次模型输入仍保留原始 AI tool-call。
+- 工具节点抛出未处理异常时，验证当前实现不会声称获得了节点内部的部分结果；不得把“没有 ToolMessage”推断成“工具没有执行”。
+- `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、`GraphRecursionError` 和 `asyncio.CancelledError` 分别测试其传播/错误码，不能统一转成普通 `tool_error`。
+- 日志测试使用 `caplog` 验证异常有 traceback；验证 API key、完整用户消息和敏感工具参数不进入日志或用户回复。
 
 ### M5.4 Conversation 场景
 
@@ -525,18 +580,22 @@ model
 - 系统提示词只出现一次。
 - 连续 `send()` 保留多轮历史。
 - 两个不同 `conversation_id` 的历史互不干扰。
-- 连续使用不同 `AgentRunContext` 调用同一 Agent 时，事件接收器和 run_id 不串线；默认 `run_context=None` 不需要任何存储依赖。
+- V0.1 只验证 `run_id`/`conversation_id`（如实现日志关联）不会泄漏到 Agent 实例或下一次调用；不把未启用的 `event_sink`/`cancel_signal` 当作有效功能。V0.6 启用真实消费逻辑后，再补事件顺序、取消和 fencing token 测试。
 - 轮次边界才触发压缩；压缩器替换后历史正确。
 - 硬截断按完整轮次进行：保留系统提示词 + 最近 N 个完整轮次，不切断工具链。
-- `AgentRunError` 携带完整状态 `messages` 时，`Conversation` 直接替换历史并追加 `safe_message`，旧历史不重复。
-- Agent 抛异常后下一轮仍可继续。
-- `ToolNode` 发生框架级异常时，保留下来的历史不得存在没有对应 `ToolMessage` 的 `tool_call_id`；实现可以生成安全失败 `ToolMessage`，或回退到产生该工具调用之前的完整状态。
+- `AgentResult(error_code != None)` 返回时，`Conversation` 保留本轮 `HumanMessage` 和已确认的协议有效状态，并能向调用方暴露错误码或等价状态；不能只剩一段无法分类的字符串。
+- Agent 抛普通 `Exception`、`KeyboardInterrupt`、`asyncio.CancelledError` 或 compactor 异常时，分别验证 HumanMessage 的提交语义；当前未实现持久 journal 前，不声称具备崩溃恢复。
+- 执行阶段取消后，CLI 能报告本轮取消并回到输入循环；输入阶段 Ctrl+C 仍可退出。
+- 失败后下一轮仍可继续，且重新发送给模型的历史通过本地序列化/结构检查：没有孤儿 `ToolMessage`，每个 `tool_call_id` 不重复、不遗漏。
+- 自定义 compactor 不能删除首条 system prompt，也不能切断 AI tool-call 与 ToolMessage 配对。
+- `AgentRunContext` 在真正消费前只验证调用级隔离，不测试不存在的取消/事件效果；一旦启用消费逻辑，必须新增对应行为测试。
 
 ### M5 验收
 
 - `test_agent.py`、`test_conversation.py` 不需要 `.env`。
 - 断网时仍能运行全部单元测试。
 - 测试证明完整工具闭环和多轮短期记忆，而不只是模型工厂。
+- 测试必须优先验证用户可观察行为和消息协议，不把 LangGraph 内部节点调用次数当作唯一契约。
 
 ## 11. 里程碑 M6：把 main.py 升级为 CLI
 
@@ -572,7 +631,7 @@ def main(agent_factory: Callable[[], Conversation] | None = None) -> int:
 
 支持：
 
-- 普通文本发送给 `Conversation.send()`。
+- 普通文本发送给 `Conversation.send()`，再输出返回结果的 `reply`；适配器可根据 `error_code` 展示本轮失败或取消。
 - 完整单词 `/exit`、`/quit` 退出（也接受带尾部空格）。
 - 空输入直接忽略。
 - Ctrl+C 友好退出。
@@ -585,7 +644,9 @@ def main(agent_factory: Callable[[], Conversation] | None = None) -> int:
 
 - 配置错误：写 stderr，退出码 1。
 - 初始化错误：写 stderr，退出码 1。
-- 单轮模型/Agent 错误：报告本轮失败，允许继续输入。
+- 单轮预期模型/工具错误：报告本轮失败，允许继续输入，并依赖 Agent/应用日志保留根因。
+- 执行阶段 `KeyboardInterrupt`/取消：报告本轮取消，允许继续输入；输入阶段 `KeyboardInterrupt`/EOF：正常退出。
+- 未预期的框架/调度器错误：用户只看到安全错误，日志保留 traceback；是否继续由 CLI 边界的错误分类决定，不在 Agent 内无条件吞掉。
 - 正常退出：退出码 0。
 - 不打印 API key、traceback 或内部对象表示。
 
@@ -596,8 +657,10 @@ def main(agent_factory: Callable[[], Conversation] | None = None) -> int:
 - 配置错误仍返回 1。
 - 正常启动使用注入的假 `Conversation`，不访问网络。
 - `/exit` 能结束循环。
-- 普通输入会传给 Conversation 并打印结果。
-- 单轮异常后仍能处理下一条输入。
+- 普通输入会传给 Conversation 并打印 `result.reply`。
+- 单轮失败后仍能处理下一条输入。
+- 执行阶段取消后仍能处理下一条输入；输入阶段 Ctrl+C/EOF 正常退出。
+- 用户可见输出不包含 traceback，开发日志包含关联的错误记录。
 
 ### M6 验收
 
@@ -610,14 +673,15 @@ def main(agent_factory: Callable[[], Conversation] | None = None) -> int:
 
 ### M7.1 日志
 
-使用标准库 `logging`：
+使用标准库 `logging`，参考 Hermes 的工具边界 `logger.exception()`，但不照搬其大型项目日志体系：
 
 - 根据配置设置日志级别。
 - 记录模型调用开始、结束和耗时。
 - 记录工具名、成功或失败和耗时。
+- 记录错误阶段、异常类型、`tool_call_id`（如有）、`run_id`/`conversation_id`（如有）。
 - 不记录 API key。
 - 默认不记录完整系统提示词和完整用户消息内容。
-- 错误日志不记录底层异常文本，只记录领域错误类型和简要原因。
+- 错误日志保留 traceback 供开发者定位，但对用户和模型只返回安全领域错误；原始异常文本不得直接进入模型消息，敏感参数必须脱敏或摘要化。
 - 日志输出统一过一道密钥过滤，作为最后保险。
 
 暂时不需要日志数据库、分布式追踪或监控平台。
@@ -663,8 +727,10 @@ M0 已配置 Ruff 基线规则；M1 清理存量代码后，M1–M6 每个里程
 - 单元测试不访问真实模型 API。
 - 有一个显式开启的真实 API smoke test。
 - 工具循环存在严格上限。
-- 模型和工具异常不会让整个程序崩溃。
+- 预期的模型/工具失败会返回安全状态并记录 traceback；取消和 LangGraph 控制流异常不会被伪装成普通工具失败；CLI 能在定义的单轮边界继续运行。
 - 上下文硬截断按完整轮次进行，不切断工具链。
+- 所有保留的消息历史通过离线协议检查：每个 `ToolMessage` 有前置 `AIMessage(tool_calls=...)`，每个 `tool_call_id` 不重复、不遗漏。
+- 取消、并行工具部分失败和日志脱敏均有行为测试；未实现的持久恢复能力不写入 V0.1 完成承诺。
 - pytest 和 Ruff 全部通过。
 
 ## 14. 框架完成后的扩展顺序
@@ -716,14 +782,14 @@ KEEP_RECENT_TURNS=          # 压缩后保留的原始轮数
 - 只读工具稳定前不实现写入工具和用户命令通道。
 - **进度账本防卡死（随 V0.3 只读工具一起落地，V0.1 不实现）**：
   - 新增配置 `MAX_STALL_ROUNDS`，默认 3，范围 2–5。
-  - `AgentState` 增加 `progress_log: list[ProgressRecord]` 和 `stalled: bool`；图扩展为 `model → tools → increment_tool_rounds → record_progress`，`record_progress` 在 `stalled=True` 时结束图并由 `Agent.invoke` 抛 `AgentStallError`，否则回到 `model`。
+  - `AgentState` 增加 `progress_log: list[ProgressRecord]` 和 `stalled: bool`；图扩展为 `model → tools → increment_tool_rounds → record_progress`，`record_progress` 在 `stalled=True` 时结束图，由 `Agent.invoke` 返回 `AgentResult(error_code="agent_stall")`，否则回到 `model`。
   - `ProgressRecord` 保留 `round_index`、`current_goal`、`current_subtask`、`tool_names`、`args_digest`、`results_digest`、`final_reply` 等元数据；但 **stall_signature 只能由规范化后的 `tool_names + args_digest + results_digest` 计算**。
   - `stall_signature` 明确不包含 `round_index`、时间戳、调用 ID、随机 ID、`final_reply` 或任何每轮必然变化的字段，否则永远不会重复。
   - 参数规范化采用**深键排序 + 稳定序列化**（如排序后的 JSON），对象属性顺序不同视为同一调用；并行工具调用还要对工具名和参数做确定性排序，避免同一组调用因顺序不同被误判为变化。
   - **被拒绝或执行失败的调用同样计数**：模型反复撞同一个被拒工具正是典型死循环；簿记类工具可以配置排除，但排除不能"洗白"中间夹着的重复调用。
   - **进度账本只属于单次 `Agent.invoke` 的 `AgentState`**：`progress_log` 和卡死计数随一次调用创建、随调用结束丢弃，绝不放进 Agent 实例字段；Agent 保持无状态，可被多个 `Conversation` 复用。以后需要跨轮次统计时，由 `Conversation`/`ConversationStore` 按 `conversation_id` 持有。
   - `progress_log` 只保存规范化摘要或哈希，不保存文件内容、密钥或完整工具输出。
-  - 判定：最近 `MAX_STALL_ROUNDS` 条记录的 `stall_signature` 相同且没有最终回复 → `AgentStallError`；改变工具名、参数摘要、结果摘要或产生最终回复都会重置。
+  - 判定：最近 `MAX_STALL_ROUNDS` 条记录的 `stall_signature` 相同且没有最终回复 → `AgentResult(error_code="agent_stall")`；改变工具名、参数摘要、结果摘要或产生最终回复都会重置。
   - `MAX_STALL_ROUNDS > MAX_TOOL_ROUNDS` 时允许，卡死检测可能被硬上限先截断，这不是配置错误，因为 `MAX_TOOL_ROUNDS` 已经保证不会无限循环。
 
 ### V0.4：工作目录内文件写入与惰性建议
