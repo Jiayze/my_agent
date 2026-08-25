@@ -8,4 +8,3 @@ logs/
 *.egg-info/
 temp_readme.md
 local_artifacts/
-agent_plan.md
