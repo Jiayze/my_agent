@@ -8,10 +8,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
+from stat import S_ISDIR
 
 from dotenv import dotenv_values
 
-VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+VALID_LOG_LEVEL_ORDER = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+VALID_LOG_LEVELS = frozenset(VALID_LOG_LEVEL_ORDER)
+
+TEMPERATURE_MINIMUM = 0
+TEMPERATURE_MAXIMUM = 2
+_TEMPERATURE_RANGE_DESCRIPTION = (
+    f"a finite number between {TEMPERATURE_MINIMUM} and {TEMPERATURE_MAXIMUM}"
+)
+_UNSET = object()
 
 
 class ConfigurationError(ValueError):
@@ -31,8 +40,7 @@ class ConfigurationError(ValueError):
 def _require_string(name: str, value: object, *, secret: bool = False) -> str:
     """校验字符串非空并去除首尾空白"""
     if not isinstance(value, str) or not value.strip():
-        suffix = " must be configured" if secret else " must be a non-empty string"
-        raise ConfigurationError(name, suffix.strip())
+        raise ConfigurationError(name, "must be a non-empty string")
     return value.strip()
 
 
@@ -42,60 +50,84 @@ def _require_integer(
     *,
     minimum: int,
     maximum: int | None = None,
+    raw_value: object = _UNSET,
 ) -> int:
     """校验整数类型及其数值范围并返回规范化后的整数"""
+    range_description = _integer_range_description(minimum, maximum)
+    display_value = value if raw_value is _UNSET else raw_value
     if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ConfigurationError(name, "must be an integer")
+        raise ConfigurationError(
+            name,
+            f"must be {range_description}, got: {display_value!r}",
+        )
     normalized = int(value)
     if normalized < minimum or (maximum is not None and normalized > maximum):
-        if maximum is None:
-            raise ConfigurationError(
-                name,
-                f"must be greater than or equal to {minimum}",
-            )
-        raise ConfigurationError(name, f"must be between {minimum} and {maximum}")
+        raise ConfigurationError(
+            name,
+            f"must be {range_description}, got: {display_value!r}",
+        )
     return normalized
 
 
-def _require_temperature(value: object) -> float:
-    """校验 temperature 是 0 到 2 之间的有限数值"""
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ConfigurationError(
+def _integer_range_description(minimum: int, maximum: int | None) -> str:
+    """根据整数边界生成唯一的范围描述"""
+    if maximum is None:
+        return f"an integer greater than or equal to {minimum}"
+    return f"an integer between {minimum} and {maximum}"
+
+
+def _require_temperature(value: object, *, raw_value: object = _UNSET) -> float:
+    """校验 temperature 是允许范围内的有限数值"""
+    display_value = value if raw_value is _UNSET else raw_value
+
+    def invalid_temperature() -> ConfigurationError:
+        return ConfigurationError(
             "temperature",
-            "must be a finite number between 0 and 2",
+            f"must be {_TEMPERATURE_RANGE_DESCRIPTION}, got: {display_value!r}",
         )
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise invalid_temperature()
     try:
         normalized = float(value)
     except (OverflowError, TypeError, ValueError) as error:
-        raise ConfigurationError(
-            "temperature",
-            "must be a finite number between 0 and 2",
-        ) from error
-    if not math.isfinite(normalized) or not 0 <= normalized <= 2:
-        raise ConfigurationError(
-            "temperature",
-            "must be a finite number between 0 and 2",
-        )
+        raise invalid_temperature() from error
+    if (
+        not math.isfinite(normalized)
+        or not TEMPERATURE_MINIMUM <= normalized <= TEMPERATURE_MAXIMUM
+    ):
+        raise invalid_temperature()
     return normalized
 
 
 def _require_workspace_root(value: object) -> Path:
     """校验工作目录路径存在且确实是目录并返回规范化路径"""
-    if not isinstance(value, (str, os.PathLike)):
+    if not isinstance(value, Path):
         raise ConfigurationError("workspace_root", "must be a path")
+
+    workspace_root: Path | None = None
     try:
-        workspace_root = Path(value).expanduser().resolve()
-    except (OSError, RuntimeError) as error:
+        workspace_root = value.expanduser().resolve()
+        file_stat = workspace_root.stat()
+    except FileNotFoundError as error:
+        display_path = workspace_root if workspace_root is not None else value
         raise ConfigurationError(
             "workspace_root",
-            "could not be resolved",
+            f"does not exist: {display_path}",
         ) from error
-    if not workspace_root.exists():
+    except NotADirectoryError as error:
+        display_path = workspace_root if workspace_root is not None else value
         raise ConfigurationError(
             "workspace_root",
-            f"does not exist: {workspace_root}",
-        )
-    if not workspace_root.is_dir():
+            f"is not a directory: {display_path}",
+        ) from error
+    except (OSError, RuntimeError) as error:
+        display_path = workspace_root if workspace_root is not None else value
+        raise ConfigurationError(
+            "workspace_root",
+            f"could not be accessed: {display_path}",
+        ) from error
+    if not S_ISDIR(file_stat.st_mode):
         raise ConfigurationError(
             "workspace_root",
             f"is not a directory: {workspace_root}",
@@ -107,7 +139,7 @@ def _require_log_level(value: object) -> str:
     """校验日志级别并将其规范化为大写字符串"""
     normalized = _require_string("log_level", value).upper()
     if normalized not in VALID_LOG_LEVELS:
-        allowed = ", ".join(sorted(VALID_LOG_LEVELS))
+        allowed = ", ".join(VALID_LOG_LEVEL_ORDER)
         raise ConfigurationError("log_level", f"must be one of: {allowed}")
     return normalized
 
@@ -187,9 +219,11 @@ DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 def _read_required(environment: Mapping[str, str | None], name: str) -> str:
     """读取必填字符串配置并拒绝缺失、空字符串和纯空白值"""
     raw_value = environment.get(name)
-    if not isinstance(raw_value, str) or not raw_value.strip():
+    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
         raise ConfigurationError(name, "is required")
-    return raw_value
+    if not isinstance(raw_value, str):
+        raise ConfigurationError(name, "must be a non-empty string")
+    return raw_value.strip()
 
 
 def _read_optional(
@@ -198,10 +232,12 @@ def _read_optional(
     default: str,
 ) -> str:
     """读取可选字符串配置并在缺失时返回默认值"""
-    raw_value = environment.get(name, default)
+    raw_value = environment.get(name)
+    if raw_value is None:
+        raw_value = default
     if not isinstance(raw_value, str):
         raise ConfigurationError(name, "must be a string")
-    return raw_value
+    return raw_value.strip()
 
 
 def _read_defaulted_required(
@@ -211,7 +247,7 @@ def _read_defaulted_required(
 ) -> str:
     """读取带默认值的必填字符串并拒绝最终为空的值"""
     raw_value = _read_optional(environment, name, default)
-    if not raw_value.strip():
+    if not raw_value:
         raise ConfigurationError(name, "is required")
     return raw_value
 
@@ -223,51 +259,43 @@ def _parse_integer(
     *,
     minimum: int,
     maximum: int | None = None,
-    range_description: str,
 ) -> int:
     """读取环境配置，将其解析为整数并校验指定的数值范围
 
     解析或校验失败时抛出结构化且便于阅读的 ConfigurationError
     """
-    raw_value = _read_optional(environment, name, default).strip()
+    raw_value = _read_optional(environment, name, default)
     try:
         normalized = int(raw_value)
     except ValueError as error:
+        range_description = _integer_range_description(minimum, maximum)
         raise ConfigurationError(
             name,
             f"must be {range_description}, got: {raw_value!r}",
         ) from error
-    try:
-        return _require_integer(
-            name,
-            normalized,
-            minimum=minimum,
-            maximum=maximum,
-        )
-    except ConfigurationError as error:
-        raise ConfigurationError(
-            name,
-            f"must be {range_description}, got: {raw_value!r}",
-        ) from error
+    return _require_integer(
+        name,
+        normalized,
+        minimum=minimum,
+        maximum=maximum,
+        raw_value=raw_value,
+    )
 
 
 def _parse_temperature(environment: Mapping[str, str | None]) -> float:
     """读取环境中的 temperature，解析为浮点数并校验其范围"""
-    raw_value = _read_optional(environment, "TEMPERATURE", "0").strip()
+    raw_value = _read_optional(environment, "CHAT_MODEL_TEMPERATURE", "0")
     try:
         normalized = float(raw_value)
     except ValueError as error:
         raise ConfigurationError(
-            "TEMPERATURE",
-            f"must be a finite number between 0 and 2, got: {raw_value!r}",
+            "CHAT_MODEL_TEMPERATURE",
+            f"must be {_TEMPERATURE_RANGE_DESCRIPTION}, got: {raw_value!r}",
         ) from error
     try:
-        return _require_temperature(normalized)
+        return _require_temperature(normalized, raw_value=raw_value)
     except ConfigurationError as error:
-        raise ConfigurationError(
-            "TEMPERATURE",
-            f"must be a finite number between 0 and 2, got: {raw_value!r}",
-        ) from error
+        raise error.renamed("CHAT_MODEL_TEMPERATURE") from None
 
 
 def load_config(
@@ -285,24 +313,27 @@ def load_config(
         merged.update(dotenv_values(dotenv_path=env_file, interpolate=False))
     merged.update(os.environ if environ is None else environ)
 
-    raw_workspace_root = _read_optional(merged, "WORKSPACE_ROOT", "").strip()
+    raw_workspace_root = _read_optional(merged, "WORKSPACE_ROOT", "")
     workspace_root = raw_workspace_root or str(PROJECT_ROOT)
 
     try:
         return AgentConfig(
-            api_key=_read_required(merged, "DEEPSEEK_API_KEY"),
-            model_id=_read_defaulted_required(merged, "MODEL_ID", "deepseek-v4-flash"),
+            api_key=_read_required(merged, "CHAT_MODEL_API_KEY"),
+            model_id=_read_defaulted_required(
+                merged,
+                "CHAT_MODEL_ID",
+                "deepseek-v4-flash",
+            ),
             base_url=_read_defaulted_required(
                 merged,
-                "BASE_URL",
+                "CHAT_MODEL_BASE_URL",
                 "https://api.deepseek.com",
             ),
             request_timeout_seconds=_parse_integer(
                 merged,
-                "REQUEST_TIMEOUT_SECONDS",
+                "CHAT_MODEL_REQUEST_TIMEOUT_SECONDS",
                 "60",
                 minimum=1,
-                range_description="an integer greater than 0",
             ),
             max_tool_rounds=_parse_integer(
                 merged,
@@ -310,7 +341,6 @@ def load_config(
                 "4",
                 minimum=1,
                 maximum=10,
-                range_description="an integer between 1 and 10",
             ),
             temperature=_parse_temperature(merged),
             workspace_root=Path(workspace_root),
@@ -318,12 +348,12 @@ def load_config(
         )
     except ConfigurationError as error:
         field_names = {
-            "api_key": "DEEPSEEK_API_KEY",
-            "model_id": "MODEL_ID",
-            "base_url": "BASE_URL",
-            "request_timeout_seconds": "REQUEST_TIMEOUT_SECONDS",
+            "api_key": "CHAT_MODEL_API_KEY",
+            "model_id": "CHAT_MODEL_ID",
+            "base_url": "CHAT_MODEL_BASE_URL",
+            "request_timeout_seconds": "CHAT_MODEL_REQUEST_TIMEOUT_SECONDS",
             "max_tool_rounds": "MAX_TOOL_ROUNDS",
-            "temperature": "TEMPERATURE",
+            "temperature": "CHAT_MODEL_TEMPERATURE",
             "workspace_root": "WORKSPACE_ROOT",
             "log_level": "LOG_LEVEL",
         }
