@@ -37,7 +37,7 @@ class ConfigurationError(ValueError):
         return type(self)(field, self.reason)
 
 
-def _require_string(name: str, value: object, *, secret: bool = False) -> str:
+def _require_string(name: str, value: object) -> str:
     """校验字符串非空并去除首尾空白"""
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationError(name, "must be a non-empty string")
@@ -166,7 +166,7 @@ class AgentConfig:
         object.__setattr__(
             self,
             "api_key",
-            _require_string("api_key", self.api_key, secret=True),
+            _require_string("api_key", self.api_key),
         )
         object.__setattr__(self, "model_id", _require_string("model_id", self.model_id))
         object.__setattr__(self, "base_url", _require_string("base_url", self.base_url))
@@ -298,6 +298,12 @@ def _parse_temperature(environment: Mapping[str, str | None]) -> float:
         raise error.renamed("CHAT_MODEL_TEMPERATURE") from None
 
 
+def _parse_workspace_root(environment: Mapping[str, str | None]) -> Path:
+    """读取环境中的工作目录路径，未配置时回退到项目根目录"""
+    raw_value = _read_optional(environment, "WORKSPACE_ROOT", "")
+    return Path(raw_value) if raw_value else PROJECT_ROOT
+
+
 def load_config(
     env_file: str | Path | None = DEFAULT_ENV_PATH,
     *,
@@ -312,9 +318,6 @@ def load_config(
     if env_file is not None:
         merged.update(dotenv_values(dotenv_path=env_file, interpolate=False))
     merged.update(os.environ if environ is None else environ)
-
-    raw_workspace_root = _read_optional(merged, "WORKSPACE_ROOT", "")
-    workspace_root = raw_workspace_root or str(PROJECT_ROOT)
 
     try:
         return AgentConfig(
@@ -343,7 +346,7 @@ def load_config(
                 maximum=10,
             ),
             temperature=_parse_temperature(merged),
-            workspace_root=Path(workspace_root),
+            workspace_root=_parse_workspace_root(merged),
             log_level=_read_optional(merged, "LOG_LEVEL", "INFO"),
         )
     except ConfigurationError as error:
@@ -360,4 +363,4 @@ def load_config(
         public_field = field_names.get(error.field, error.field)
         if public_field == error.field:
             raise
-        raise error.renamed(public_field) from error
+        raise error.renamed(public_field) from None
