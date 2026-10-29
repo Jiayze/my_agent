@@ -1,43 +1,33 @@
-import math
-from numbers import Real
+"""根据经过校验的应用配置创建聊天模型"""
+
+from __future__ import annotations
+
+import logging
+import traceback
+from dataclasses import replace
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
-from my_agent.config import AgentConfig
-from my_agent.models import ModelConfigurationError
+from my_agent.config import AgentConfig, url_secret_fragments
+from my_agent.deepseek_chat import DeepSeekChatModel
+
+logger = logging.getLogger(__name__)
 
 
-def _require_non_empty_string(name: str, value: object) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ModelConfigurationError(f"{name} must be a non-empty string")
-    return value.strip()
+class ModelInitializationError(RuntimeError):
+    """配置有效但无法创建模型客户端时抛出的错误"""
 
 
-def _require_temperature(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ModelConfigurationError(
-            "temperature must be a finite number between 0 and 2"
-        )
-    try:
-        normalized = float(value)
-    except (OverflowError, TypeError, ValueError):
-        raise ModelConfigurationError(
-            "temperature must be a finite number between 0 and 2"
-        ) from None
-    if not math.isfinite(normalized) or not 0 <= normalized <= 2:
-        raise ModelConfigurationError(
-            "temperature must be a finite number between 0 and 2"
-        )
-    return normalized
-
-
-def _require_timeout(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ModelConfigurationError(
-            "request_timeout_seconds must be a positive integer"
-        )
-    return value
+def _format_safe_traceback(error: Exception, *, secrets: tuple[str, ...]) -> str:
+    """格式化诊断 traceback 并移除已知的配置秘密"""
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    ).rstrip()
+    for secret in secrets:
+        if secret:
+            formatted = formatted.replace(secret, "[REDACTED]")
+    return formatted
 
 
 def create_chat_model(
@@ -48,29 +38,50 @@ def create_chat_model(
     api_key: str | None = None,
     temperature: float | None = None,
 ) -> BaseChatModel:
-    effective_model_id = _require_non_empty_string(
-        "model_id", config.model_id if model_id is None else model_id
-    )
-    effective_base_url = _require_non_empty_string(
-        "base_url", config.base_url if base_url is None else base_url
-    )
-    effective_api_key = _require_non_empty_string(
-        "api_key", config.api_key if api_key is None else api_key
-    )
-    effective_temperature = _require_temperature(
-        config.temperature if temperature is None else temperature
-    )
-    request_timeout_seconds = _require_timeout(config.request_timeout_seconds)
+    """创建聊天模型并复用 AgentConfig 校验显式覆盖参数
+
+    非法覆盖参数遵循与直接构造 AgentConfig 相同的配置契约
+    客户端库初始化失败会单独包装，使调用方能够区分输入错误和启动依赖错误；
+    原始异常仍保留在 __cause__ 中
+    """
+    overrides: dict[str, object] = {}
+    if model_id is not None:
+        overrides["model_id"] = model_id
+    if base_url is not None:
+        overrides["base_url"] = base_url
+    if api_key is not None:
+        overrides["api_key"] = api_key
+    if temperature is not None:
+        overrides["temperature"] = temperature
+
+    effective = replace(config, **overrides) if overrides else config
+
+    client_kwargs: dict[str, object] = {
+        "api_key": effective.api_key,
+        "model": effective.model_id,
+        "base_url": effective.base_url,
+        "timeout": effective.request_timeout_seconds,
+    }
 
     try:
-        return ChatOpenAI(
-            api_key=effective_api_key,
-            model=effective_model_id,
-            base_url=effective_base_url,
-            temperature=effective_temperature,
-            timeout=request_timeout_seconds,
+        if effective.thinking_enabled:
+            # DeepSeek 思考模式不支持 temperature；省略该参数而不是传一个无效值。
+            # thinking 必须放在 extra_body，reasoning_effort 才是官方顶层参数。
+            return DeepSeekChatModel(
+                **client_kwargs,
+                extra_body={"thinking": {"type": "enabled"}},
+                reasoning_effort=effective.reasoning_effort,
+            )
+        # 未显式打开思考模式时保持原有 OpenAI 兼容路径与 temperature 语义。
+        return ChatOpenAI(**client_kwargs, temperature=effective.temperature)
+    except Exception as error:
+        logger.error(
+            "chat model initialization failed\n%s",
+            _format_safe_traceback(
+                error,
+                secrets=(effective.api_key, *url_secret_fragments(effective.base_url)),
+            ),
         )
-    except Exception:
-        raise ModelConfigurationError(
+        raise ModelInitializationError(
             "failed to initialize chat model; check model configuration"
-        ) from None
+        ) from error

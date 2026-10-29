@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from collections.abc import Sequence
 from typing import Any
@@ -75,30 +76,25 @@ def _format_safe_traceback(error: BaseException) -> str:
     return f"Traceback (most recent call last):\n{frames}\n{type(error).__name__}"
 
 
-def _handle_tool_error(
-    error: ToolException,
-    *,
-    tool_name: str,
-    tool_call_id: str,
-) -> str:
-    """把明确的工具业务失败转成安全文本并记录脱敏调用栈"""
-    logger.error(
-        "tool execution failed; tool=%s tool_call_id=%s exception_type=%s\n%s",
-        tool_name,
-        tool_call_id,
-        type(error).__name__,
-        _format_safe_traceback(error),
-    )
+def _handle_tool_error(error: ToolException) -> str:
+    """把明确的工具业务失败映射为安全文本
+
+    日志由唯一的工具调用包装点负责，避免同一异常被重复记录。
+    """
     if isinstance(error, ToolInvocationError):
         return _SAFE_TOOL_INPUT_MESSAGE
     return _SAFE_TOOL_EXECUTION_FAILED_MESSAGE
 
 
 def _require_read_only_tools(tools: Sequence[BaseTool]) -> None:
-    """V0.1 只执行组合根明确注入的只读工具"""
+    """V0.1 只执行显式声明 effect 且为只读的工具"""
     for tool in tools:
         metadata = tool.metadata or {}
-        effect = metadata.get("effect", "read_only")
+        if "effect" not in metadata:
+            raise ValueError(
+                f"tool {tool.name!r} must declare an explicit 'effect' metadata"
+            )
+        effect = metadata["effect"]
         if effect != "read_only":
             raise ValueError(
                 f"tool {tool.name!r} requires a side-effect execution policy; "
@@ -332,26 +328,31 @@ class Agent:
             run_context.run_id if run_context is not None else "unknown",
             run_context.conversation_id if run_context is not None else "unknown",
         )
+        started = time.perf_counter()
         try:
             response = self._bound_model.invoke(list(current), config=config)
         except GraphBubbleUp:
             raise
         except Exception as error:
+            duration_ms = (time.perf_counter() - started) * 1000
             if not _is_expected_model_error(error):
                 logger.error(
                     "unexpected model invocation error; "
-                    "run_id=%s conversation_id=%s\n%s",
+                    "run_id=%s conversation_id=%s duration_ms=%.1f\n%s",
                     run_context.run_id if run_context is not None else "unknown",
                     run_context.conversation_id
                     if run_context is not None
                     else "unknown",
+                    duration_ms,
                     _format_safe_traceback(error),
                 )
                 raise
             logger.error(
-                "model invocation failed; run_id=%s conversation_id=%s\n%s",
+                "model invocation failed; run_id=%s conversation_id=%s "
+                "duration_ms=%.1f\n%s",
                 run_context.run_id if run_context is not None else "unknown",
                 run_context.conversation_id if run_context is not None else "unknown",
+                duration_ms,
                 _format_safe_traceback(error),
             )
             return {"terminal_error": "model_error"}
@@ -362,9 +363,17 @@ class Agent:
                 type(response).__name__,
             )
             raise ModelProtocolError(
-                "model returned unexpected message type: "
-                f"{type(response).__name__}"
+                f"model returned unexpected message type: {type(response).__name__}"
             )
+
+        logger.info(
+            "model invocation finished; run_id=%s conversation_id=%s "
+            "duration_ms=%.1f tool_calls=%d",
+            run_context.run_id if run_context is not None else "unknown",
+            run_context.conversation_id if run_context is not None else "unknown",
+            (time.perf_counter() - started) * 1000,
+            len(response.tool_calls),
+        )
 
         if not response.tool_calls and not _normalize_content(response.content).strip():
             return {"terminal_error": "empty_model_response"}
@@ -375,39 +384,56 @@ class Agent:
         state: AgentState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        """执行当前状态中的工具调用并记录工具结果"""
-        result = self._tools_node.invoke(state, config=config)
+        """执行当前状态中的工具调用
 
-        if isinstance(result, dict):
-            for message in result.get("messages", ()):
-                if isinstance(message, ToolMessage):
-                    logger.info(
-                        "tool result recorded; tool=%s tool_call_id=%s status=%s",
-                        message.name,
-                        message.tool_call_id,
-                        message.status,
-                    )
-        return result
+        每个工具的耗时和结果状态由 ``_wrap_tool_call`` 统一记录。
+        """
+        return self._tools_node.invoke(state, config=config)
 
     @staticmethod
     def _wrap_tool_call(request: Any, execute: Any) -> Any:
         """只转换明确的工具业务异常并保留原始调用关联"""
         call = request.tool_call
+        tool_name = str(call.get("name", "unknown"))
+        tool_call_id = str(call.get("id", "unknown"))
+        started = time.perf_counter()
         try:
-            return execute(request)
+            result = execute(request)
         except ToolException as error:
-            tool_name = str(call.get("name", "unknown"))
-            tool_call_id = str(call.get("id", "unknown"))
+            logger.error(
+                "tool execution failed; tool=%s tool_call_id=%s duration_ms=%.1f "
+                "exception_type=%s\n%s",
+                tool_name,
+                tool_call_id,
+                (time.perf_counter() - started) * 1000,
+                type(error).__name__,
+                _format_safe_traceback(error),
+            )
             return ToolMessage(
-                content=_handle_tool_error(
-                    error,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                ),
+                content=_handle_tool_error(error),
                 name=tool_name,
                 tool_call_id=tool_call_id,
                 status="error",
             )
+        except Exception as error:
+            logger.error(
+                "unexpected tool execution error; tool=%s tool_call_id=%s "
+                "duration_ms=%.1f exception_type=%s\n%s",
+                tool_name,
+                tool_call_id,
+                (time.perf_counter() - started) * 1000,
+                type(error).__name__,
+                _format_safe_traceback(error),
+            )
+            raise
+
+        logger.info(
+            "tool execution finished; tool=%s tool_call_id=%s duration_ms=%.1f",
+            tool_name,
+            tool_call_id,
+            (time.perf_counter() - started) * 1000,
+        )
+        return result
 
     def _increment_tool_rounds(self, state: AgentState) -> dict[str, int]:
         """将工具调用轮数增加一轮"""

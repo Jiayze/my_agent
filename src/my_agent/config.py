@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
 from stat import S_ISDIR
+from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
 
 from dotenv import dotenv_values
 
@@ -21,6 +22,20 @@ _TEMPERATURE_RANGE_DESCRIPTION = (
     f"a finite number between {TEMPERATURE_MINIMUM} and {TEMPERATURE_MAXIMUM}"
 )
 _UNSET = object()
+
+VALID_REASONING_EFFORTS = ("low", "high", "max")
+"""DeepSeek 思考模式官方支持的 reasoning_effort 取值"""
+
+DEFAULT_REASONING_EFFORT = "high"
+"""官方默认推理强度；仅在 thinking_enabled 时才会发送"""
+
+_THINKING_VALUES = {"enabled": True, "disabled": False}
+
+UNPRINTABLE_URL = "<redacted-url>"
+"""无法安全解析时用于替代原始 URL 的固定占位符"""
+
+_MIN_SECRET_FRAGMENT_LENGTH = 4
+"""短于此长度的 URL 片段不参与脱敏，避免把普通文本大面积替换掉"""
 
 
 class ConfigurationError(ValueError):
@@ -144,6 +159,92 @@ def _require_log_level(value: object) -> str:
     return normalized
 
 
+def _require_thinking_enabled(value: object) -> bool:
+    """校验思考模式开关是真正的布尔值"""
+    if not isinstance(value, bool):
+        raise ConfigurationError("thinking_enabled", "must be a boolean")
+    return value
+
+
+def _require_reasoning_effort(value: object) -> str:
+    """校验 reasoning_effort 并规范化为小写"""
+    normalized = _require_string("reasoning_effort", value).lower()
+    if normalized not in VALID_REASONING_EFFORTS:
+        allowed = ", ".join(VALID_REASONING_EFFORTS)
+        raise ConfigurationError("reasoning_effort", f"must be one of: {allowed}")
+    return normalized
+
+
+def _split_url(url: str) -> SplitResult | None:
+    """解析 URL，无法解析时返回 None 而不是抛出异常"""
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return None
+
+
+def safe_url_summary(url: str) -> str:
+    """返回只含 scheme/host/port 的 URL 摘要
+
+    丢弃 userinfo、路径、查询和片段，因此形如
+    ``https://alice:sk-xxx@example.invalid/v1?token=yyy`` 的地址不会把代理凭据
+    或查询参数中的 token 带进日志；无法解析的地址统一显示为固定占位符。
+    """
+    parts = _split_url(url)
+    if parts is None or not parts.scheme or not parts.hostname:
+        return UNPRINTABLE_URL
+    try:
+        port = parts.port
+    except ValueError:
+        return UNPRINTABLE_URL
+
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if port is None:
+        return f"{parts.scheme}://{host}"
+    return f"{parts.scheme}://{host}:{port}"
+
+
+def url_secret_fragments(url: str) -> tuple[str, ...]:
+    """提取 URL 中可能作为凭据的片段，供日志脱敏使用
+
+    覆盖 userinfo（用户名、密码以及完整的 ``user:password`` 串）、查询参数值
+    和片段值。第三方库常把完整 URL 写进异常文本，把这些片段交给日志过滤器
+    即可在 traceback 中一并抹掉。
+    """
+    parts = _split_url(url)
+    if parts is None:
+        return ()
+
+    fragments: set[str] = set()
+    if "@" in parts.netloc:
+        userinfo = parts.netloc.rpartition("@")[0]
+        fragments.add(userinfo)
+        fragments.add(unquote(userinfo))
+    if parts.username:
+        fragments.add(parts.username)
+        fragments.add(unquote(parts.username))
+    if parts.password:
+        fragments.add(parts.password)
+        fragments.add(unquote(parts.password))
+    for values in parse_qs(parts.query, keep_blank_values=True).values():
+        for value in values:
+            fragments.add(value)
+            fragments.add(unquote(value))
+    if parts.fragment:
+        fragments.add(parts.fragment)
+        fragments.add(unquote(parts.fragment))
+
+    return tuple(
+        sorted(
+            fragment
+            for fragment in fragments
+            if len(fragment) >= _MIN_SECRET_FRAGMENT_LENGTH
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
     """经过校验且不可变的应用配置
@@ -160,6 +261,8 @@ class AgentConfig:
     temperature: float
     workspace_root: Path
     log_level: str
+    thinking_enabled: bool = False
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
     def __post_init__(self) -> None:
         """校验并规范化所有配置字段"""
@@ -196,17 +299,33 @@ class AgentConfig:
             _require_workspace_root(self.workspace_root),
         )
         object.__setattr__(self, "log_level", _require_log_level(self.log_level))
+        object.__setattr__(
+            self,
+            "thinking_enabled",
+            _require_thinking_enabled(self.thinking_enabled),
+        )
+        object.__setattr__(
+            self,
+            "reasoning_effort",
+            _require_reasoning_effort(self.reasoning_effort),
+        )
 
     def safe_summary(self) -> dict[str, object]:
-        """返回不包含 API key 的启动诊断摘要"""
+        """返回不含 API key 和 URL 凭据的启动诊断摘要
+
+        ``base_url`` 只保留 scheme/host/port，避免 userinfo 或查询参数中的
+        token 通过诊断信息回显。
+        """
         return {
             "model_id": self.model_id,
-            "base_url": self.base_url,
+            "base_url": safe_url_summary(self.base_url),
             "request_timeout_seconds": self.request_timeout_seconds,
             "max_tool_rounds": self.max_tool_rounds,
             "temperature": self.temperature,
             "workspace_root": str(self.workspace_root),
             "log_level": self.log_level,
+            "thinking_enabled": self.thinking_enabled,
+            "reasoning_effort": self.reasoning_effort,
             "api_key_configured": True,
         }
 
@@ -304,6 +423,35 @@ def _parse_workspace_root(environment: Mapping[str, str | None]) -> Path:
     return Path(raw_value) if raw_value else PROJECT_ROOT
 
 
+def _parse_thinking_enabled(environment: Mapping[str, str | None]) -> bool:
+    """读取显式思考模式开关；默认关闭以保留 OpenAI 兼容原路径"""
+    raw_value = _read_optional(environment, "CHAT_MODEL_THINKING", "disabled")
+    normalized = raw_value.lower()
+    if normalized not in _THINKING_VALUES:
+        raise ConfigurationError(
+            "CHAT_MODEL_THINKING",
+            "must be one of: enabled, disabled",
+        )
+    return _THINKING_VALUES[normalized]
+
+
+def _parse_reasoning_effort(environment: Mapping[str, str | None]) -> str:
+    """读取思考模式推理强度并校验官方取值"""
+    raw_value = _read_optional(
+        environment,
+        "CHAT_MODEL_REASONING_EFFORT",
+        DEFAULT_REASONING_EFFORT,
+    )
+    normalized = raw_value.lower()
+    if normalized not in VALID_REASONING_EFFORTS:
+        allowed = ", ".join(VALID_REASONING_EFFORTS)
+        raise ConfigurationError(
+            "CHAT_MODEL_REASONING_EFFORT",
+            f"must be one of: {allowed}, got: {raw_value!r}",
+        )
+    return normalized
+
+
 def load_config(
     env_file: str | Path | None = DEFAULT_ENV_PATH,
     *,
@@ -348,6 +496,8 @@ def load_config(
             temperature=_parse_temperature(merged),
             workspace_root=_parse_workspace_root(merged),
             log_level=_read_optional(merged, "LOG_LEVEL", "INFO"),
+            thinking_enabled=_parse_thinking_enabled(merged),
+            reasoning_effort=_parse_reasoning_effort(merged),
         )
     except ConfigurationError as error:
         field_names = {
@@ -359,6 +509,8 @@ def load_config(
             "temperature": "CHAT_MODEL_TEMPERATURE",
             "workspace_root": "WORKSPACE_ROOT",
             "log_level": "LOG_LEVEL",
+            "thinking_enabled": "CHAT_MODEL_THINKING",
+            "reasoning_effort": "CHAT_MODEL_REASONING_EFFORT",
         }
         public_field = field_names.get(error.field, error.field)
         if public_field == error.field:

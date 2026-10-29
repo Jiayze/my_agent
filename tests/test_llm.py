@@ -1,12 +1,10 @@
 import importlib
 import sys
-from pathlib import Path
 
 import pytest
 
-from my_agent.config import AgentConfig
-from my_agent.llm import create_chat_model
-from my_agent.models import ModelConfigurationError
+from my_agent.config import PROJECT_ROOT, AgentConfig, ConfigurationError
+from my_agent.llm import ModelInitializationError, create_chat_model
 
 
 def make_config(**overrides: object) -> AgentConfig:
@@ -17,9 +15,8 @@ def make_config(**overrides: object) -> AgentConfig:
         "request_timeout_seconds": 30,
         "max_tool_rounds": 4,
         "temperature": 0.3,
-        "workspace_root": Path("workspace"),
+        "workspace_root": PROJECT_ROOT,
         "log_level": "INFO",
-        "allow_shell": False,
     }
     defaults.update(overrides)
     return AgentConfig(**defaults)  # type: ignore[arg-type]
@@ -102,28 +99,47 @@ def test_create_chat_model_allows_zero_temperature_override(
     assert fake_chat_openai.calls[0]["temperature"] == 0.0
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("api_key", ""),
-        ("api_key", "   "),
-        ("model_id", ""),
-        ("model_id", "   "),
-        ("base_url", ""),
-        ("base_url", "   "),
-    ],
-)
-def test_create_chat_model_rejects_blank_string_values(
-    fake_chat_openai: type[RecordingChatOpenAI],
-    field: str,
-    value: str,
+def test_create_chat_model_uses_thinking_adapter_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ModelConfigurationError) as exc_info:
-        create_chat_model(make_config(**{field: value}))
+    calls: list[dict[str, object]] = []
 
-    assert field in str(exc_info.value)
-    assert "test-api-key" not in str(exc_info.value)
-    assert fake_chat_openai.calls == []
+    class RecordingDeepSeekChatModel:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "my_agent.llm.DeepSeekChatModel",
+        RecordingDeepSeekChatModel,
+    )
+
+    create_chat_model(
+        make_config(thinking_enabled=True, reasoning_effort="max", temperature=0.3)
+    )
+
+    assert calls == [
+        {
+            "api_key": "test-api-key",
+            "model": "test-model",
+            "base_url": "https://example.invalid/v1",
+            "timeout": 30,
+            "extra_body": {"thinking": {"type": "enabled"}},
+            "reasoning_effort": "max",
+        }
+    ]
+    # DeepSeek 思考模式忽略 temperature，适配器必须省略而不是发送无效值。
+    assert "temperature" not in calls[0]
+
+
+def test_create_chat_model_keeps_plain_openai_path_when_thinking_disabled(
+    fake_chat_openai: type[RecordingChatOpenAI],
+) -> None:
+    create_chat_model(make_config(thinking_enabled=False, reasoning_effort="max"))
+
+    call = fake_chat_openai.calls[0]
+    assert "extra_body" not in call
+    assert "reasoning_effort" not in call
+    assert call["temperature"] == 0.3
 
 
 @pytest.mark.parametrize(
@@ -142,7 +158,7 @@ def test_create_chat_model_rejects_blank_overrides(
     field: str,
     value: str,
 ) -> None:
-    with pytest.raises(ModelConfigurationError):
+    with pytest.raises(ConfigurationError):
         create_chat_model(make_config(), **{field: value})
 
     assert fake_chat_openai.calls == []
@@ -156,31 +172,20 @@ def test_create_chat_model_rejects_invalid_temperature(
     fake_chat_openai: type[RecordingChatOpenAI],
     value: object,
 ) -> None:
-    with pytest.raises(ModelConfigurationError, match="temperature"):
+    with pytest.raises(ConfigurationError, match="temperature"):
         create_chat_model(make_config(), temperature=value)  # type: ignore[arg-type]
 
     assert fake_chat_openai.calls == []
 
 
-@pytest.mark.parametrize("value", [0, -1, 3.5, True, False])
-def test_create_chat_model_rejects_invalid_timeout(
-    fake_chat_openai: type[RecordingChatOpenAI],
-    value: object,
-) -> None:
-    with pytest.raises(ModelConfigurationError, match="request_timeout_seconds"):
-        create_chat_model(make_config(request_timeout_seconds=value))  # type: ignore[arg-type]
-
-    assert fake_chat_openai.calls == []
-
-
-def test_create_chat_model_normalizes_string_values(
+def test_create_chat_model_uses_validated_config_values(
     fake_chat_openai: type[RecordingChatOpenAI],
 ) -> None:
     create_chat_model(
         make_config(
-            api_key="  config-key  ",
-            model_id="  config-model  ",
-            base_url="  https://example.invalid/v1  ",
+            api_key="config-key",
+            model_id="config-model",
+            base_url="https://example.invalid/v1",
         )
     )
 
@@ -193,45 +198,9 @@ def test_create_chat_model_normalizes_string_values(
     }
 
 
-def test_create_chat_model_blocks_invalid_config_before_client_creation(
-    fake_chat_openai: type[RecordingChatOpenAI],
-) -> None:
-    with pytest.raises(ModelConfigurationError, match="api_key"):
-        create_chat_model(make_config(api_key=object()))  # type: ignore[arg-type]
-
-    assert fake_chat_openai.calls == []
-
-
-def test_create_chat_model_blocks_empty_model_id(
-    fake_chat_openai: type[RecordingChatOpenAI],
-) -> None:
-    config = make_config(model_id="")
-
-    with pytest.raises(ModelConfigurationError) as exc_info:
-        create_chat_model(config)
-
-    message = str(exc_info.value)
-    assert "model_id" in message
-    assert "test-api-key" not in message
-    assert len(fake_chat_openai.calls) == 0
-
-
-def test_create_chat_model_blocks_empty_base_url(
-    fake_chat_openai: type[RecordingChatOpenAI],
-) -> None:
-    config = make_config(base_url="")
-
-    with pytest.raises(ModelConfigurationError) as exc_info:
-        create_chat_model(config)
-
-    message = str(exc_info.value)
-    assert "base_url" in message
-    assert "test-api-key" not in message
-    assert len(fake_chat_openai.calls) == 0
-
-
 def test_create_chat_model_wraps_initialization_error_without_leaking_key(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     class ExplodingChatOpenAI:
         def __init__(self, **kwargs: object) -> None:
@@ -239,12 +208,16 @@ def test_create_chat_model_wraps_initialization_error_without_leaking_key(
 
     monkeypatch.setattr("my_agent.llm.ChatOpenAI", ExplodingChatOpenAI)
 
-    with pytest.raises(ModelConfigurationError) as exc_info:
-        create_chat_model(make_config())
+    with caplog.at_level("ERROR", logger="my_agent.llm"):
+        with pytest.raises(ModelInitializationError) as exc_info:
+            create_chat_model(make_config())
 
     message = str(exc_info.value)
     assert "test-api-key" not in message
-    assert exc_info.value.__cause__ is None
+    assert "test-api-key" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert "Traceback" in caplog.text
+    assert exc_info.value.__cause__ is not None
 
 
 def test_import_llm_does_not_construct_a_client(

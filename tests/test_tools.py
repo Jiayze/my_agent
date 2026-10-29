@@ -2,11 +2,13 @@
 
 import pytest
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
 
 from my_agent.tools import (
     DuplicateToolNameError,
     ToolRegistry,
+    ToolRegistryError,
     UnknownToolError,
     add_numbers,
 )
@@ -48,6 +50,10 @@ def test_add_numbers_has_name_and_description() -> None:
     assert add_numbers.name == "add_numbers"
     assert isinstance(add_numbers.description, str)
     assert "计算两个数字之和" in add_numbers.description
+
+
+def test_add_numbers_declares_read_only_effect() -> None:
+    assert add_numbers.metadata == {"effect": "read_only"}
 
 
 def test_add_numbers_exposes_valid_tool_schema() -> None:
@@ -99,26 +105,31 @@ def test_registry_rejects_unknown_tool() -> None:
 def test_registry_rejects_non_string_tool_name_on_lookup() -> None:
     registry = ToolRegistry([add_numbers])
 
-    with pytest.raises(UnknownToolError):
+    with pytest.raises(TypeError):
         registry.get_tool(["add_numbers"])  # type: ignore[arg-type]
 
 
-def test_registry_get_tools_returns_a_copy() -> None:
+def test_registry_get_tools_is_immutable() -> None:
     registry = ToolRegistry([add_numbers])
 
     tools = registry.get_tools()
-    tools.clear()
 
-    assert len(registry.get_tools()) == 1
+    with pytest.raises(AttributeError):
+        tools.clear()  # type: ignore[attr-defined]
 
 
-def test_registry_get_tool_names_returns_a_copy() -> None:
+def test_registry_get_tool_names_is_immutable() -> None:
     registry = ToolRegistry([add_numbers])
 
     names = registry.get_tool_names()
-    names.clear()
 
-    assert registry.get_tool_names() == {"add_numbers"}
+    with pytest.raises(AttributeError):
+        names.clear()  # type: ignore[attr-defined]
+
+
+def test_registry_rejects_non_langchain_tools() -> None:
+    with pytest.raises(ToolRegistryError, match="BaseTool"):
+        ToolRegistry([object()])  # type: ignore[list-item]
 
 
 def test_registry_instances_do_not_share_state() -> None:
@@ -127,3 +138,16 @@ def test_registry_instances_do_not_share_state() -> None:
 
     assert first.get_tool_names() == {"add_numbers"}
     assert second.get_tool_names() == {"multiply_numbers"}
+
+
+def test_registry_tools_bind_to_openai_compatible_model_without_network() -> None:
+    registry = ToolRegistry([add_numbers])
+    model = ChatOpenAI(
+        api_key="test-api-key",
+        model="test-model",
+        base_url="https://example.invalid/v1",
+    )
+
+    bound = model.bind_tools(registry.get_tools())
+
+    assert bound is not None

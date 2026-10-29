@@ -10,8 +10,8 @@
 4. **Agent 是无状态执行核心**：`Agent.invoke(messages, *, run_context=None)` 只做"消息序列 + 本次调用上下文 → 结果"，不保存历史。V0.1 的 `run_context` 只携带本轮 `run_id`、可选 `conversation_id`；调用结束即丢弃，不能成为对话记忆或跨轮状态。取消信号和事件接收器属于未来版本新增的上下文能力，不能在 V0.1 类型或文档中被当作已提供。
 5. **Conversation 持有短期记忆**：每个对话一个 `Conversation`，系统提示词只注入一次，上下文压缩只发生在这一层。
 6. **TOTP 动态验证码**：所有 `/command ` 统一进入认证状态机；TOTP 采用 RFC 6238，兼容 Google Authenticator 等验证器。威胁模型是"QQ 账号被盗 / 消息伪造 / 模型诱导"，不覆盖实体手机丢失和主机已被攻破；重放、限流、过期必须实现。成功输码后进入 10 分钟免输码窗口（`TOTP_GRACE_MINUTES` 默认 10，可设 0 关闭）。免输码窗口绑定 `(credential_id, transport, channel_id, verified_source_id, command_session_id)`，其中 session ID 只能由 CLI、QQ、SSH、桌面等可信适配器生成；一个端或连接输码不能让另一个端或连接免码。窗口自最近一次成功输码起算，不因免码执行续期；窗口内的命令没有再次证明来自验证器持有人，这是为便利性明确接受的剩余风险，严格模式可配置为 0。
-7. **Agent 默认禁止高风险能力，但支持未来 coding profile**：V0.1–V0.4 不向默认 Agent 注册任意 Shell、`git commit/push/reset/revert`、删除文件、修改系统配置或工作目录外写入工具；Agent 只能输出惰性建议文本，由用户自行复制并通过 `/command ` 执行。未来 coding profile 可以显式装配 `ShellToolPlugin` 等 side-effect capability，默认仍关闭，不能恢复成一个 `ALLOW_SHELL=true/false` 开关，也不能让模型自行批准自己的命令。
-8. **工作目录内写入是 coding profile 能力**：默认 Agent 不装配写入工具；未来 coding profile 可以在 V0.4 通过真实路径校验、快照和回滚服务写入 `WORKSPACE_ROOT` 内的文件。目录外的写入工具直接拒绝并给出 `/command ` 建议，不做“审批后由 Agent 写目录外”。
+7. **Agent 默认禁止高风险能力，但支持未来 coding profile**：V0.1–V0.4 不向默认 Agent 注册任意 Shell、`git commit/push/reset/revert`、删除文件、修改系统配置或工作目录外写入工具；Agent 只能输出惰性建议文本，由用户自行复制并通过 `/command ` 执行。未来 coding profile 可以显式装配 `ShellToolPlugin` 等 side-effect capability，默认仍关闭，不能恢复成一个 `ALLOW_SHELL=true/false` 开关，也不能让模型自行批准自己的命令。目录外写入按决策 8 的一次性授权升级实现，仍不属于默认 Agent。
+8. **写入能力分两级，且目录外升级必须排在审批基础设施之后**：默认 Agent 不装配写入工具。**V0.4 只交付工作目录内写入**：coding profile 可通过真实路径校验、快照和回滚服务写入 `WORKSPACE_ROOT` 内的文件。**目录外写入不永久拒绝，但最早随 V0.5.1 开放**：它依赖 V0.5 的 TOTP/审批服务和 V0.5.1 的 pending-action 暂停/恢复边界，因此不得在 V0.4 暴露一个只有未来接口的审批通道。开放后只能以**一次性授权升级**的形式发生：模型提交结构化 `AgentActionRequest`（规范化真实目标路径、操作类型、理由、内容哈希），由用户经可信通道（TOTP 或桌面审批 UI，适用决策 6 的威胁模型）显式批准；批准只对该 `request_id` + 精确路径 + 该次内容生效，用后即失效，不产生常驻授权，不修改 session mode（见决策 20），也不能退化成一个 `ALLOW_WRITE_ANYWHERE=true` 开关。升级写入与工作目录内写入共用同一个副作用执行器（intent → snapshot → executing → done，可回滚按快照回滚）和同一套审计；批准时用户必须看到规范化后的真实目标路径与操作摘要。未批准、超时或审批通道不可用一律拒绝（fail closed），并回落到 `/command ` 建议。**常驻拒绝清单不可升级**：应用自身状态目录（intent/审计库、密钥、spill 文件）与系统目录（`%WINDIR%`、`System32` 等）；删除文件、Git 历史改写、修改系统配置仍不在此通道提供。首次默认（可调整）：授权单次、不跨进程重启保留、同一 `request_id` 只执行一次。**里程碑职责划分**：V0.4 完成工作目录内写入、受保护子树、intent/快照/回滚，并完成 grant **数据模型**但不开放目录外执行；V0.5 完成 TOTP、审批服务和命令状态机；V0.5.1 完成 Agent pending/resume、`PolicyResolver`、一次性目录外 grant、Shell 沙盒与网络策略；V0.6 再加持久会话事件投影与跨进程恢复。若坚持在 V0.4 就开放目录外写入，则 V0.4 必须同时提前交付最小可信审批适配器与 pending-action 恢复机制，工作量会显著扩大，因此不采用。
 9. **Agent 与命令通道隔离**：用户输入中明确以 `/command ` 开头的消息进入命令通道；Agent 回复、工具结果、文件或知识库内容中的 `/command ` 文本永远只是普通文本，不能触发执行。未来启用 Agent Shell capability 时，模型只能提交结构化的 `AgentActionRequest` 给同一个命令执行服务，不能通过生成 `/command ` 文本旁路触发，也不能跳过用户审批、审计和执行状态机。
 10. **保留指令格式**：所有带参数的特殊指令必须是 `/xxx ` 形式（斜杠开头、指令词后带空格）。无参数退出指令 `/exit`、`/quit` 按完整单词匹配。
 11. **上下文压缩**：摘要使用独立配置的模型；`SUMMARIZER_MODEL_ID` 等配置为空时回落到常规对话模型。常规模型和摘要模型可以相同，配置填什么就用什么。
@@ -23,6 +23,9 @@
 17. **进度账本防卡死（V0.3 落地）**：V0.1 先用 `max_tool_rounds`、`recursion_limit` 和模型请求超时防卡死，不实现完整进度账本。V0.3 与只读工具一起实现 `progress_log`；检测到卡死时返回 `AgentResult(error_code="agent_stall")`。契约提前锁定：卡死签名只由规范化后的工具名、参数摘要、结果摘要组成，不包含轮次、时间戳、调用 ID、随机 ID 等每轮变化字段，并行工具调用先排序再规范化。
 18. **SSH 是第二管理通道**：SSH/Tailscale 适配器作为 QQ 的可靠备用通道，复用同一个 `Conversation`、`CommandRequest` 和 TOTP 状态机；SSH 只暴露 forced command 最小协议，不直接给完整 shell，也不给 Agent 任何 SSH 能力。
 19. **Shell 是可选插件，不是 Agent 核心内建能力**：当前项目先保持 Agent 默认无 Shell；但 M4 的工具、结果和上下文契约必须给未来的 `ShellToolPlugin` 留出位置。插件必须复用统一的副作用执行/审批服务，不能在工具函数里直接散落 `subprocess` 调用。未实现结构化暂停、恢复、审计和未知结果分类前，只允许 Agent 给出 `/command ` 建议，不得把“执行 Shell”伪装成普通无副作用工具。
+20. **策略模型：`mode`（上限）× `effect`（需求）× `scope`（目标）× `decision`（决议）**：`mode ∈ {read-only, workspace-write}` 是当前 profile/session 的能力上限（部署默认 `read-only`；Agent 不存在 `danger-full-access` 常驻态）；`effect`（`read_only | workspace_write | host_command`，见 M3.1）是工具本次调用请求的能力等级，普通情况下 `effect` 超过 `mode` 即拒绝；`scope`（`workspace | approved_external | protected_denied`）表达目标范围，因为 `effect` 无法区分“工作目录内”与“目录外”；`network_access`（默认 `restricted`）与文件策略并列，是策略的一等维度。`decision ∈ {allow | prompt | forbidden}` 是本次策略的最终结果：多条规则命中时**取最严者**（`forbidden > prompt > allow`）；`forbidden` 位于审批和一次性 grant **之上**，任何授权都不能绕过；`prompt` 在审批通道不可用时返回结构化的 `unavailable`/`rejected`，绝不自动放行；一次性 grant 只能把本次 `prompt` 变成可执行，**不能把 `forbidden` 变成 `allow`**。三档对应：只读操作 `allow`；测试、安装、启动、普通写入 `prompt`；删除、push、Git 历史改写等 `forbidden`。目录外的一次性授权是**逐操作 grant**（绑定 `request_id` + 精确规范化路径 + 操作 + 内容哈希），既不修改 session mode，也不能把禁止类别变成允许类别。policy 由 resolver/executor 强制执行，绝不依赖系统提示词让模型“自行遵守”。**用户 `/command ` 通道不套用本决策**：经 TOTP 的用户命令按命令通道的决策处理，不做 Agent execpolicy 的语义 allow-list。**`prompt` 的适用范围**：用户通道的 10 分钟免输码窗口（grace window）**只属于用户通道**，绝不适用于任何 Agent 发起的请求——每一次 Agent 侧 `prompt` 都必须有一次针对该具体操作的显式人类裁决，不得因为“刚刚输过码”而自动放行。**`forbidden` 的判定手段只是尽力而为的纵深防线**：字符串/前缀匹配必然能被变形绕过（`g&it push`、`Remove-Item -Recurse`、`cmd /c` 套壳等），因此它绝不能作为唯一防线，真正的边界是 OS 后端；无法可靠解析的复合命令一律降级为 `prompt`，不得默认为 `allow`。
+21. **审批决策者是可替换的缝隙，但 V0.1–V0.5.x 不实现自动审批**：当前所有副作用都必须由用户经可信通道批准。契约必须让"以后加自动审批"表现为**新增一个决策者实现**，而不是重构：审批决策建模为按顺序尝试的**决策者链**（`ApprovalDecider`），每次询问返回 `allowed-once` / `rejected` / `unavailable` / `defer`（`defer` = 交给链上的下一个决策者，等价于 waterfall 的 `next()`）；链上没有任何决定性答复时一律 fail closed。当前链只有人类适配器一个元素。评审状态机、副作用执行器和审计事件都**不得假定决策者一定是人**：executor 只接收已决议的执行计划，状态机只消费结果，审计在 `approval/decided` 中记录 `decided_by`。未来的自动审批以独立决策者插入（例如"低风险自动允许、其余 `defer` 给人类"），必须满足：只能作用于本来就需要人类批准的那一档，**不得绕过常驻拒绝清单与"永久禁止"类别**；必须使用独立于当前 Agent 轮次的辅助模型调用；`decided_by` 必须能区分人类与自动决策者；每个决策者的判定必须有界、可审计、可整体关闭。审批配置只有两态：**`ask`（把请求交给已组合的决策者）与 `never`（确定性拒绝，不询问任何人）**——`never` 不是“关闭审批后放行”，因此**不引入 `manual/smart/off` 或 `yolo` 语义**：不需要审批由 `decision = allow` 表达，永不允许由 `forbidden` 表达。决策者实现为**有序 waterfall**：每个决策者要么给出结果、要么 `next()` 委派给下一个，部署必须组合一个**终止决策者**；没有终止决策者时一律 `unavailable` 并 fail closed，审批服务自身永不主动询问人类。`never` 必须在 waterfall **之前**判定，使后注册的决策者无法绕过；服务层必须**容纳决策者的任何失败**——抛异常的决策者归一为 `unavailable`，返回非词汇值的决策者同样归一为 `unavailable`，**任何情况下都不得 fail open**。当前只组合人类适配器一个决策者。
+22. **策略规则源与优先级必须固定，且工作目录内的文件永不净放宽策略**：`decision` 由**有序规则源**折叠得出，优先级固定为「内建 `forbidden`（不可配置、不可升级）> 部署/profile 策略 > 本次会话的 grant > 部署默认」。**工作目录内的任何文件（`AGENTS.md`、项目规则、`global_rules.md`）只能表达说明与建议，不能放宽策略**——否则 Agent 写一个规则文件就能给自己提权，这与 `.git/hooks` 属于同一类提权向量。`allow/prompt/forbidden` 的权威定义位于 `PolicyResolver` 的策略源，任何文件都不得成为它的替代副本。
 
 ### 0.1 外部源码复核后固定的工程规则
 
@@ -53,15 +56,15 @@
 | 发生位置 | 例子 | Agent/工具层行为 | CLI/适配器行为 |
 | --- | --- | --- | --- |
 | 配置/启动边界 | 缺少 API key、客户端初始化失败 | 配置对象抛出 `ConfigurationError`；模型工厂把已验证配置无法创建客户端的错误包装为 `ModelInitializationError`，记录 cause 和 traceback | 打印安全诊断并以退出码 1 结束 |
-| 工具业务边界 | 参数校验、未知工具、网络/IO/第三方服务失败 | 记录工具上下文；返回唯一的 `ToolMessage(status="error")`，让模型继续 | 通常显示模型生成的解释；若图以 `tool_error` 结束则显示安全失败文本 |
+| 工具业务边界 | 参数校验、未知工具、明确分类为可恢复的网络/IO/第三方服务失败 | 记录工具上下文；返回唯一的 `ToolMessage(status="error")`，让模型继续 | 通常显示模型生成的解释；若图以 `tool_error` 结束则显示安全失败文本 |
 | 模型预期失败 | API 超时、认证/服务端错误、空最终响应 | 返回 `AgentResult(error_code="model_error" / "empty_model_response")`；记录 traceback；不把底层异常文本放进消息 | 显示安全失败并继续下一轮 |
 | 业务上限 | 工具轮数达到 `max_tool_rounds` | 闭合已产生的 tool-call，返回 `error_code="tool_round_limit"` | 显示达到上限并继续 |
 | 框架硬保险 | `GraphRecursionError` | 返回 `error_code="recursion_limit"`，记录 traceback | 显示安全失败并继续或结束当前适配器任务 |
-| 用户取消 | 执行阶段 `KeyboardInterrupt`、`CancelledError` 或已实现的取消信号 | 可复用 Agent 核心默认传播取消控制流；只有明确的应用适配器策略才转换为取消状态，不转成 `tool_error` | 报告本轮取消，保留已确认状态并回到输入循环 |
+| 用户取消 | 执行阶段 `KeyboardInterrupt`、`asyncio.CancelledError`、LangGraph `NodeCancelledError` 或已实现的取消信号 | 可复用 Agent 核心默认传播取消控制流；只有明确的应用适配器策略才转换为取消状态，不转成 `tool_error` | 报告本轮取消，保留已确认状态并回到输入循环 |
 | LangGraph 控制流 | `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained` | 保持控制流语义，不由工具 handler 吞掉；按实际根图 API 传播/转换 | 由单轮边界决定继续、暂停或结束 |
-| 未预期编程/调度器错误 | `NameError`、状态 reducer 错误、executor 崩溃 | `logger.exception()` 记录完整 traceback；不伪装成业务 `ToolMessage`，传播到单轮边界 | 显示固定安全错误；是否继续由 CLI 的明确策略决定 |
+| 未预期编程/调度器错误 | `NameError`、状态 reducer 错误、executor 崩溃 | 安全日志记录脱敏 traceback；不伪装成业务 `ToolMessage`，传播到单轮边界 | 显示固定安全错误；是否继续由 CLI 的明确策略决定 |
 
-工具 handler 的异常处理只覆盖明确的工具业务边界，并且必须位于控制流异常已排除的边界之后；第一方工具默认不依赖异常名称白名单猜测“程序员错误”，插件隔离才可以显式选择 catch-all。`wrap_tool_call` 负责上下文、重试或观测，`handle_tool_errors`（或工具自身的失败策略）负责唯一一次错误转换，不在多个层级重复包装同一异常。预期失败的“返回”与未预期错误的“传播”都是契约的一部分。
+工具 handler 的异常处理只覆盖明确的工具业务边界，并且必须位于控制流异常已排除的边界之后；第一方工具默认不依赖异常名称白名单猜测“程序员错误”，插件隔离才可以显式选择 catch-all。`wrap_tool_call` 负责上下文、重试或观测，`handle_tool_errors` 或工具自身的失败策略负责唯一一次错误转换，不在多个层级重复包装同一异常。预期失败的“返回”与未预期错误的“传播”都是契约的一部分。
 
 ---
 
@@ -81,18 +84,21 @@
 
 ## 2. 当前项目判断
 
-本次重构从 M3 完成点开始。正式进度必须始终以完成验收的里程碑计算，不能因为工作区存在后续文件就把进度提前记到 M4：
+本次重构从 M3 完成点开始。进度以实际实现、测试和复审为依据，并分别记录离线验收与真实服务验收。以下状态更新于 2026-10-29：
 
 ```text
 my_agent/
 ├── pyproject.toml
-├── .env
+├── .env                         # 仅本地配置，Git 忽略
 ├── .env.example
 ├── src/
 │   └── my_agent/
 │       ├── __init__.py
+│       ├── __main__.py           # python -m my_agent
 │       ├── config.py
 │       ├── llm.py
+│       ├── deepseek_chat.py      # reasoning_content 接收与回传
+│       ├── logging_setup.py      # 日志与凭据脱敏
 │       ├── agent.py              # M4 无状态执行核心
 │       ├── main.py
 │       ├── models.py
@@ -108,23 +114,25 @@ my_agent/
     ├── test_tools.py
     ├── test_agent.py
     ├── test_conversation.py
+    ├── test_deepseek_wire.py
     └── test_main.py
 ```
 
-当前正式进度：**M3 完成，M4 尚未开始验收**。
+当前进度：**M4、M6/M7 的离线实现与独立复审已通过；真实 DeepSeek API 验收待完成**。
+最新离线测试为 **193 passed、3 skipped**，Ruff lint/format 通过。真实工具闭环与下一轮 reasoning 回传保留为 **LIVE_UNVERIFIED**，不将模拟 HTTP 结果记为真实服务成功。
 
-当前代码已经完成（M0–M3）：
+当前已具备的基础与离线验收能力：
 
 - `AgentConfig` 是不可变且自校验的可信配置对象；直接构造和环境加载遵循同一契约，`load_config()` 只负责读取/解析来源且不修改 `os.environ`。
 - 使用 `.env` 或显式环境映射加载模型、工作目录和日志级别；对必填配置、超时、温度和工具轮数进行校验。
 - `ALLOW_SHELL` 已从 V0.1 配置中删除；默认 Agent 不携带 Shell。未来 coding profile 若启用 Shell，必须通过显式插件和独立执行策略装配，不能复用一个布尔配置开关。
 - `safe_summary()` 不会泄露 API key。
-- `main()` 仍负责加载配置并输出安全摘要；CLI 交互式组装属于 M6，尚未开始。
+- `main()` 已组装模型、工具、Agent 与 Conversation，并提供连续对话、退出、取消与预期错误恢复的最小 CLI；进程入口对未预期异常提供脱敏边界。
 - 模型工厂复用 `AgentConfig` 做 override 校验；非法输入使用 `ConfigurationError`，已验证配置无法创建客户端时使用 `ModelInitializationError`，保留 cause 和开发日志。
 - `ToolRegistry` 只接收 `BaseTool`，按名称唯一索引并提供不可变视图；未知名称与调用者类型错误分开。
 - `ToolRegistry` 和无副作用演示工具已经完成，M3 工具测试保留。
 
-工作区中的 `agent.py`、`conversation.py`、`AgentResult` 及其测试属于此前生成的 **M4 工作草稿**。在重新进入 M4 前保持冻结，不计入已完成进度，也不能作为 M0–M3 前置重构的验收依据。重新进入 M4 时必须按本计划最新的可复用核心契约审查并重构，不默认继承草稿行为。
+`agent.py`、`conversation.py`、`AgentResult` 及其测试已按 M4 契约完成离线验收，包含消息克隆隔离、输入前缀保留与保序校验、工具 effect 显式声明及调用结果配对。DeepSeek 兼容层与流式协议已有离线请求体契约覆盖，仍须通过显式启用的 live 测试完成真实服务验收。
 
 正确路线是先按本计划冻结错误、消息和取消契约，再在现有模块边界内做小范围重构；不为解决 V0.1 问题提前创建 `storage/`、`adapters/` 或事件溯源目录。
 
@@ -133,7 +141,7 @@ my_agent/
 ### 3.1 必须完成
 
 - 命令行连续对话。
-- DeepSeek OpenAI 兼容接口。
+- OpenAI 兼容聊天模型接口（当前 live 示例使用 DeepSeek 兼容端点）。
 - LangGraph 状态图。
 - 一个安全、无副作用的演示工具。
 - 工具注册、参数校验和错误转换。
@@ -260,6 +268,7 @@ src/my_agent/
 - 把合法日志级别提取为模块常量。
 - 删除 `config.py` 中用于人工调试的直接运行入口，统一从 `main.py` 启动。
 - `AgentConfig.__post_init__()` 负责字段类型、范围、规范化和工作目录存在性校验；任何直接构造的实例也必须可信。
+- `load_config()` 在未设置 `WORKSPACE_ROOT` 时使用 `PROJECT_ROOT` 的 `Path` 值，并通过 `AgentConfig.__post_init__()` 的同一个 workspace helper 完成启动校验；不在模块导入阶段提前执行文件系统检查。
 - `ConfigurationError` 是配置输入错误；错误消息使用稳定字段名，不包含 API key。
 - `load_config()` 只负责读取 dotenv/环境映射、解析字符串和构造 `AgentConfig`；不调用 `load_dotenv()` 修改全局进程环境。
 
@@ -274,9 +283,9 @@ src/my_agent/
 对应环境变量：
 
 ```text
-REQUEST_TIMEOUT_SECONDS=60
+CHAT_MODEL_REQUEST_TIMEOUT_SECONDS=60
 MAX_TOOL_ROUNDS=4
-TEMPERATURE=0
+CHAT_MODEL_TEMPERATURE=0
 ```
 
 校验规则：
@@ -284,7 +293,7 @@ TEMPERATURE=0
 - 超时必须大于 0。
 - 工具轮数限制在 1 到 10。
 - temperature 限制在 0 到 2。
-- `BASE_URL` 和 `MODEL_ID` 不能为空。
+- `CHAT_MODEL_BASE_URL` 和 `CHAT_MODEL_ID` 不能为空。
 - 数字解析失败时，错误信息必须包含字段名、原始值和合法范围。
 
 不在 V0.1 配置中保留 `ALLOW_SHELL`。默认 Agent 不携带 Shell；未来 coding profile 通过显式 plugin/capability 装配，用户 `/command ` 仍是独立的认证适配器能力，二者都不通过一个布尔开关控制。
@@ -311,8 +320,7 @@ TEMPERATURE=0
 ### M2.1 定义创建函数
 
 ```python
-def create_chat_model(config: AgentConfig) -> BaseChatModel:
-    ...
+def create_chat_model(config: AgentConfig) -> BaseChatModel: ...
 ```
 
 使用 `langchain_openai.ChatOpenAI`，传入：
@@ -325,7 +333,7 @@ def create_chat_model(config: AgentConfig) -> BaseChatModel:
 
 不要在模块导入时创建客户端，避免测试导入时读取真实环境或建立网络连接。
 
-`AgentConfig` 已经保证的字段不在 `llm.py` 手写第二套字段校验；显式 override 通过 `dataclasses.replace()` 重建 `AgentConfig`，复用唯一配置契约。配置输入错误保持为 `ConfigurationError`；已验证配置交给 `ChatOpenAI` 后的初始化/依赖错误转换为 `ModelInitializationError`，用户可见文本不暴露底层细节，开发日志保留经过密钥脱敏的 traceback，异常 cause 仍供调试使用。这里的日志实现可以使用安全包装后的 `logger.error()`；不得为了调用 `logger.exception()` 而把未脱敏的第三方异常文本直接写入日志。BASE_URL 只做非空检查，可用性留给模型客户端初始化和真实连接阶段暴露，不猜测兼容服务的 URL 语义。
+`AgentConfig` 已经保证的字段不在 `llm.py` 手写第二套字段校验；显式 override 通过 `dataclasses.replace()` 重建 `AgentConfig`，复用唯一配置契约。配置输入错误保持为 `ConfigurationError`；已验证配置交给 `ChatOpenAI` 后的初始化/依赖错误转换为 `ModelInitializationError`，用户可见文本不暴露底层细节，开发日志保留经过密钥脱敏的 traceback，异常 cause 仍供调试使用。这里的日志实现可以使用安全包装后的 `logger.error()`；不得为了调用 `logger.exception()` 而把未脱敏的第三方异常文本直接写入日志。CHAT_MODEL_BASE_URL 只做非空检查，可用性留给模型客户端初始化和真实连接阶段暴露，不猜测兼容服务的 URL 语义。
 
 工厂应预留参数覆盖能力（model_id / base_url / api_key / temperature），V0.2 摘要模型直接复用，不复制一套客户端代码。
 
@@ -339,7 +347,7 @@ def create_chat_model(config: AgentConfig) -> BaseChatModel:
 
 ### M2.3 手动 smoke test
 
-- 只有设置 `RUN_LIVE_TESTS=1` 时才调用 DeepSeek。
+- 只有设置 `RUN_LIVE_TESTS=1` 时才调用外部模型服务；当前 live 示例使用 DeepSeek 兼容端点。
 - 使用 `@pytest.mark.live` 加 `skipif(os.getenv("RUN_LIVE_TESTS") != "1")`；普通测试默认不访问网络。
 - 先测试普通回答。
 - 再测试模型能否返回工具调用。
@@ -362,11 +370,10 @@ def create_chat_model(config: AgentConfig) -> BaseChatModel:
 注册表提供：
 
 ```python
-def get_tools() -> tuple[BaseTool, ...]:
-    ...
+def get_tools() -> tuple[BaseTool, ...]: ...
 
-def get_tool_names() -> frozenset[str]:
-    ...
+
+def get_tool_names() -> frozenset[str]: ...
 ```
 
 第一版不需要动态插件发现、依赖注入容器或配置驱动加载。注册表必须只接收 `BaseTool`，保证工具名唯一，并通过 tuple/frozenset 暴露不可变视图；测试之间不共享可变全局状态。
@@ -376,6 +383,7 @@ Shell 预留不等于现在实现 Shell。重新进入 M4 时，工具的内部�
 ```text
 effect: read_only | workspace_write | host_command
 approval: none | user_required | policy_required
+scope: workspace | approved_external | protected_denied
 retryable: bool
 timeout: bounded duration
 ```
@@ -402,7 +410,7 @@ def add_numbers(left: float, right: float) -> float:
 - 非 `BaseTool` 注册输入在构造边界拒绝。
 - 非字符串查找参数是调用者类型错误；字符串但未注册才是 `UnknownToolError`。
 - 工具描述足以让模型理解使用条件。
-- 未注册工具不能由执行节点调用。
+- 注册表按名称查找时拒绝未注册工具；执行节点拒绝未知工具属于 M4/M5 验收。
 
 ### M3 验收
 
@@ -420,9 +428,10 @@ def add_numbers(left: float, right: float) -> float:
 @dataclass(frozen=True)
 class AgentResult:
     reply: str
-    messages: tuple[BaseMessage, ...]   # 不可变，避免 frozen dataclass 持有可变 list
+    messages: tuple[BaseMessage, ...]  # 不可变，避免 frozen dataclass 持有可变 list
     tool_rounds: int
     error_code: str | None = None
+
 
 class Agent:
     def __init__(
@@ -430,16 +439,14 @@ class Agent:
         model: BaseChatModel,
         tools: ToolRegistry | Sequence[BaseTool],
         max_tool_rounds: int,
-    ):
-        ...
+    ): ...
 
     def invoke(
         self,
         messages: Sequence[BaseMessage],
         *,
         run_context: AgentRunContext | None = None,
-    ) -> AgentResult:
-        ...
+    ) -> AgentResult: ...
 ```
 
 规则：
@@ -466,25 +473,22 @@ class Conversation:
         agent: Agent,
         system_prompt: str,
         context_compactor: ContextCompactor | None = None,
-    ):
-        ...
+    ): ...
 
-    def send(self, user_message: str) -> AgentResult:
-        ...
+    def send(self, user_message: str) -> AgentResult: ...
 
     @property
-    def messages(self) -> tuple[BaseMessage, ...]:
-        ...
+    def messages(self) -> tuple[BaseMessage, ...]: ...
 ```
 
 规则：
 
 - V0.1 中历史只存在于 `Conversation` 实例内，`conversation_id` 是身份和隔离键；相同 id 的两个新实例不会自动共享历史。进程崩溃会丢失内存中的对话历史，这是第一版明确接受的：此时没有副作用工具，不存在数据破坏；真正的断点续接从 V0.6 `ConversationStore` 开始。跨端阶段再引入 `ConversationStore`，按 id 加载/保存状态，同一 id 的 `send` 必须串行化。
 - `send()` 返回本轮的 `AgentResult`，由 CLI/适配器显示 `result.reply`，并可根据 `result.error_code` 区分预期失败；不能把失败状态降格成只有一段字符串。
-- 系统提示词只在创建会话时注入一次；后续 `send()` 不再重复追加。
+- 原始静态系统提示词只在创建会话时注入一次；后续 `send()` 不再重复追加。压缩提示可以使用独立的 `SystemMessage`，但必须与原始静态提示区分，不能替换或重复原始提示。
 - 每个"用户消息 → 工具链 → 最终回复"是一个**不可交错的逻辑轮次**，不是数据库事务意义上的全成功或全回滚。V0.1 无副作用工具时，正常工具错误保留为 `ToolMessage(status="error")` 并允许模型继续；模型失败、取消或图异常时只保存已确认且协议有效的状态，并明确记录 `error_code`。不得在没有执行记录时声称工具已成功或一定未执行。
 - 压缩/截断只发生在轮次边界，系统提示词永远保留、不参与压缩。
-- 用户消息提交和 Agent 执行结果提交必须有明确边界：`send()` 为本轮 `HumanMessage` 分配稳定 message ID，并在压缩和 Agent 调用前把它作为 pending 事实提交到会话状态；收到 `AgentResult` 后，按 message ID（不是内容相等或对象身份）确认本轮消息仍存在。只有通过协议校验的 `result.messages` 才能替换可见历史。取消、compactor 异常或 Agent 未返回结果时，至少保留 pending 用户消息；没有耐久执行记录时不合成“已执行/未执行”的工具结果。V0.6 事件日志落地前，不声称具备崩溃恢复或副作用执行事实。
+- 用户消息提交和 Agent 执行结果提交必须有明确边界：`send()` 为本轮 `HumanMessage` 分配稳定 message ID，并在压缩和 Agent 调用前把它作为 pending 事实提交到会话状态；向 `Agent.invoke` 交付前，先为整条消息序列补齐唯一 ID，并对消息中的 dict/list 容器做结构克隆，切断与已提交历史的内存别名。收到 `AgentResult` 后，以本次提交的消息序列为主体逐位确认前缀的**内容与顺序均未改变**（Prefix retention & order invariant）：前缀被改写或重排抛 `changed prefix`，前缀被缩短抛 `dropped messages`；只有通过协议校验的 `result.messages` 才能替换可见历史。单进程内存隔离只承诺前缀不被丢弃与重排，不宣称绝对防篡改；跨进程/存储端的端到端校验属于 V0.6。取消、compactor 异常或 Agent 未返回结果时，至少保留 pending 用户消息；没有耐久执行记录时不合成“已执行/未执行”的工具结果。V0.6 事件日志落地前，不声称具备崩溃恢复或副作用执行事实。
 - 失败历史可以保留已确认的工具事实；`error_code` 和安全 `reply` 是结果状态，默认不把安全失败文本追加成普通成功 `AIMessage`。如果为了闭合已经产生的 tool-call 必须合成消息，必须带明确的错误/取消元数据。历史提交后再次调用模型时，必须先通过离线消息协议测试。
 - `context_compactor` 为 `None` 时使用第一版默认策略：硬截断兜底。截断单位是**完整轮次**，不是消息条数：保留静态系统提示词 + 截断提示 + 最近 N 个完整 `ConversationTurn`。一个完整轮次包括 `HumanMessage` + `AIMessage(tool_calls)` + `ToolMessage...` + `AIMessage(final reply)`；按消息条数截断可能留下 `ToolMessage` 却删除对应 `tool_calls`，禁止使用。默认常量在实现时确定并配测试；V0.2 用 token 级摘要压缩替换默认策略。
 
@@ -494,8 +498,7 @@ class Conversation:
 class ContextCompactor(Protocol):
     """返回仍可交给模型的消息；必须保留首条 system prompt 和完整 tool-call/result 配对。"""
 
-    def compact(self, messages: tuple[BaseMessage, ...]) -> tuple[BaseMessage, ...]:
-        ...
+    def compact(self, messages: tuple[BaseMessage, ...]) -> tuple[BaseMessage, ...]: ...
 ```
 
 ### 9.3 状态图
@@ -513,7 +516,7 @@ class AgentState(TypedDict):
 
 每次 `Agent.invoke` 的初始状态必须显式设置 `tool_rounds = 0`、`terminal_error = None`；这些字段都只属于本次图执行。
 
-`run_context` 使用当前 LangGraph 1.2.11 的正式 `context_schema=AgentRunContext` 和 `Runtime[AgentRunContext]` 注入给节点，并通过本次 graph invoke/stream 的 `context=` 参数传入；不把它塞进 messages、消息 reducer、任意 `configurable` 键或持久 checkpoint。禁止为了让节点访问 context 而临时写入 `self._current_context`，并发调用同一 Agent 的测试必须覆盖这一点。
+`run_context` 使用当前 LangGraph 1.2.11 的正式 `context_schema=AgentRunContext` 和 `Runtime[AgentRunContext]` 注入给节点，并通过本次 graph invoke/stream 的 `context=` 参数传入；不把它塞进 messages、消息 reducer、任意 `configurable` 键或持久 checkpoint。禁止为了让节点访问 context 而临时写入 `self._current_context`，并发调用同一 Agent 的测试必须覆盖这一点。若上下文尚未被节点或日志真实消费，不得把它描述成已实现能力。
 
 ```text
 START
@@ -543,11 +546,11 @@ model
 
 ### 9.5 工具错误处理
 
-- `ToolNode` 的错误处理参数以安装的 1.2.11 API 为准。其默认 handler 只处理模型参数/调用校验产生的 `ToolInvocationError`，其他执行异常重新抛出；V0.1 在此基础上只增加明确的领域工具异常，不用 `_PROGRAMMER_ERRORS = (NameError, ...)` 白名单反向猜测哪些异常应该传播。
+- `ToolNode` 的错误处理参数以安装的 1.2.11 API 为准。其默认 handler 只处理模型参数/调用校验产生的 `ToolInvocationError`，其他执行异常重新抛出；当前实现显式关闭默认 handler，再由 wrapper 增加明确的领域工具异常，不用 `_PROGRAMMER_ERRORS = (NameError, ...)` 白名单反向猜测哪些异常应该传播。当前 LangGraph 还会把节点自身抛出的 `asyncio.CancelledError` 转换为 `NodeCancelledError`，取消测试必须覆盖这一实际边界。
 - Shell 或其他 host-command 工具的“命令被拒绝、等待批准、超时、结果未知”不是普通 Python 异常文本，必须由统一执行服务返回结构化状态；不能让 `handle_tool_errors` 把这些状态压成一个通用失败字符串。
 - 为第一方工具定义最窄的预期失败契约（例如 `ToolExecutionError`）；网络/IO/第三方异常只有在工具实现或适配器明确判断为可恢复时才转换成该领域异常。未识别异常传播。未来第三方插件可以显式选择 catch-all + `logger.exception()` 的隔离策略，但这是插件信任边界，不是默认行为。
-- 工具错误只有一个主转换点。若 `wrap_tool_call` 用 `ContextVar` 附加工具名和 `tool_call_id`，wrapper 只设置/恢复上下文，或实现有界重试后重新抛出；不能再次调用 handler 生成第二个 `ToolMessage`。`handle_tool_errors` 负责唯一一次领域错误转换。
-- 参数缺失、参数类型错误、明确工具业务失败、未知工具：转换为安全的 `ToolMessage(status="error")`，让模型有机会向用户解释失败。未知工具必须使用原 `tool_call_id` 回填“该工具未注册”，让模型继续生成自然语言回复；任何保留下来的历史中不得出现悬空或重复的 `tool_call_id`。
+- 工具错误只有一个主转换点。当前实现将 `ToolNode` 配置为 `handle_tool_errors=False`，由 `wrap_tool_call` 唯一地把明确的 `ToolException` 转换为一个 `ToolMessage(status="error")`；wrapper 不能再次调用其他 handler 生成第二个结果。未预期异常和控制流异常继续传播。未来若改用 `handle_tool_errors`，必须保留同样的单一转换点约束。
+- 参数缺失、参数类型错误、明确工具业务失败、未知工具：转换为安全的 `ToolMessage(status="error")`，让模型有机会向用户解释失败。未知工具必须使用原 `tool_call_id` 回填“该工具未注册”，让模型继续生成自然语言回复；任何保留下来的历史中不得出现悬空或重复的 `tool_call_id`。网络/IO/第三方异常只有在工具明确判断为可恢复并转换为领域异常时才进入该边界，未识别异常传播。
 - `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、取消异常和工具调度器错误不属于普通工具业务失败，不得由 `_tools_node_fn` 的宽泛 `except Exception` 伪装成 `ToolMessage`。需要在实际 LangGraph 版本中用测试确认它们的根图传播路径。
 - 模型调用失败、空输出、轮数超限和 `GraphRecursionError` 可以转换为带 `error_code` 的安全结果；模型协议错误、取消和未预期的 Agent/图编程错误记录必要上下文后传播，由上层单轮边界决定是否继续，不在 Agent 内伪造正常 assistant 回复。
 - 空输出只指"不含 tool_calls 且规范化最终文本为空"；含 tool_calls 的空字符串 content 必须继续进入工具节点。最终文本提取同时覆盖字符串 content 和内容块列表。
@@ -576,17 +579,18 @@ model
 - `bind_tools()` 只在 Agent 构造时执行一次。
 - Agent 核心不导入任何具体工具或 profile；把不同 `ToolRegistry` 注入同一 Agent 类即可形成不同能力组合，不复制 Agent 图。
 - 没有 side-effect execution policy 时，带 `workspace_write` 或 `host_command` metadata 的工具不能被执行；默认 profile 的行为不因未来安装 coding 插件而改变。
+- 工具必须显式声明 `effect` 元数据；缺失即拒绝，不默认按 `read_only` 放行。
 - 同一 `Agent` 实例连续处理不同 `Conversation` 的消息序列，状态不串线。
 - `AgentRunContext` 在 V0.1 只作为真正消费的调用级上下文传递；在取消/事件功能尚未实现前不公开 `cancel_signal` 或 `event_sink`。调用结束后 Agent 实例不保留 run_id 或 conversation_id 引用。
 - 系统提示词在一个 `Conversation` 中只出现一次。
 - 硬截断按完整轮次进行，不切断工具链；自定义 compactor 也必须经过消息协议校验。
 - Agent 核心不依赖 stdin、stdout、`.env`、QQ 或 GUI。
 
-## 10. 里程碑 M5：Agent 与 Conversation 离线测试
+## 10. M4/M5 联合验收：Agent 与 Conversation 离线测试
 
-测试使用假模型，不依赖 DeepSeek 网络和余额。假模型必须实现 `bind_tools` 和 `invoke`；多个测试模块重复时才提取公共 fake。
+测试使用假模型，不依赖外部模型服务、网络和余额。假模型必须实现 `bind_tools` 和 `invoke`；多个测试模块重复时才提取公共 fake。
 
-### M5.1 直接回答
+### 联合测试 1：直接回答
 
 假模型直接返回 `AIMessage`，验证：
 
@@ -594,7 +598,7 @@ model
 - 工具没有被调用。
 - 消息顺序正确。
 
-### M5.2 工具调用
+### 联合测试 2：工具调用
 
 让假模型第一次返回工具调用，第二次返回最终答案，验证：
 
@@ -604,7 +608,7 @@ model
 - 最终只向调用者返回自然语言答案。
 - 一次模型响应并行调用多个工具只计一轮。
 
-### M5.3 异常、取消和消息协议场景
+### 联合测试 3：异常、取消和消息协议场景
 
 覆盖：
 
@@ -619,16 +623,16 @@ model
 - 用户可见错误不包含 API key、完整 traceback 或内部细节。
 - 一个并行工具成功、另一个普通工具异常时，验证每个 `tool_call_id` 都有唯一结果，且下一次模型输入仍保留原始 AI tool-call。
 - 工具节点抛出未处理异常时，验证当前实现不会声称获得了节点内部的部分结果；不得把“没有 ToolMessage”推断成“工具没有执行”。
-- `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、`GraphRecursionError` 和 `asyncio.CancelledError` 分别测试其传播/错误码，不能统一转成普通 `tool_error`。
+- `GraphBubbleUp`、`GraphInterrupt`、`GraphDrained`、`GraphRecursionError`、`asyncio.CancelledError` 和 `NodeCancelledError` 分别测试其传播/错误码，不能统一转成普通 `tool_error`。
 - 日志测试使用 `caplog` 验证异常有 traceback；验证 API key、完整用户消息和敏感工具参数不进入日志或用户回复。
 - 用两个显式工具组合验证插件边界：默认 registry 不包含 coding 工具；注入另一个 registry 后同一个 Agent 类可以看到新增的假工具，Agent 模块不需要导入或判断该工具的具体类型。
 - 构造一个带 `host_command` metadata 的假工具，验证缺少 side-effect execution policy 时在执行前被拒绝；测试不能实际启动子进程。
 
-### M5.4 Conversation 场景
+### 联合测试 4：Conversation 场景
 
 覆盖：
 
-- 系统提示词只出现一次。
+- 原始静态系统提示词只出现一次。
 - 连续 `send()` 保留多轮历史。
 - 两个不同 `conversation_id` 的历史互不干扰。
 - V0.1 验证 `run_id`/`conversation_id` 会在节点日志上下文中使用，且不会泄漏到 Agent 实例或下一次调用；V0.6 新增事件接收器和取消协议后，再补事件顺序、取消和 fencing token 测试。
@@ -641,7 +645,7 @@ model
 - 自定义 compactor 不能删除首条 system prompt，也不能切断 AI tool-call 与 ToolMessage 配对。
 - `AgentRunContext` 在真正消费前只验证调用级隔离，不测试不存在的取消/事件效果；一旦启用消费逻辑，必须新增对应行为测试。
 
-### M5 验收
+### M4/M5 联合验收
 
 - `test_agent.py`、`test_conversation.py` 不需要 `.env`。
 - 断网时仍能运行全部单元测试。
@@ -665,8 +669,8 @@ model
 ### M6.2 可测试接口
 
 ```python
-def run_cli(conversation: Conversation) -> int:
-    ...
+def run_cli(conversation: Conversation) -> int: ...
+
 
 def main(agent_factory: Callable[[], Conversation] | None = None) -> int:
     if agent_factory is None:
@@ -793,9 +797,9 @@ M0 已配置 Ruff 基线规则；M1 清理存量代码后，M1–M6 每个里程
 - 新增配置：
 
 ```text
-SUMMARIZER_MODEL_ID=        # 为空时使用 MODEL_ID
-SUMMARIZER_BASE_URL=        # 为空时使用 BASE_URL
-SUMMARIZER_API_KEY=         # 为空时使用 DEEPSEEK_API_KEY
+SUMMARIZER_MODEL_ID=        # 为空时使用 CHAT_MODEL_ID
+SUMMARIZER_MODEL_BASE_URL=  # 为空时使用 CHAT_MODEL_BASE_URL
+SUMMARIZER_MODEL_API_KEY=   # 为空时使用 CHAT_MODEL_API_KEY
 CONTEXT_TARGET_TOKENS=      # 软阈值，达到后触发压缩
 CONTEXT_HARD_LIMIT_TOKENS=  # 硬上限，超过后只允许硬截断
 KEEP_RECENT_TURNS=          # 压缩后保留的原始轮数
@@ -862,6 +866,7 @@ KEEP_RECENT_TURNS=          # 压缩后保留的原始轮数
   - 应用自身的安全配置目录。
   - 默认拒绝名单中的敏感文件（`.env`、密钥/凭证文件等）。
   - 规则文件（`AGENTS.md`、`my_agent_rules.md` 等，Agent 只读）。
+- **可写根的正式结构**：把上述限制提升为由 resolver 统一处理的结构，而不是散落的特判：`WritableRoot { root, read_only_subpaths, protected_metadata_names }`；判定条件为「canonical_target 位于 `root` 内 ∧ 不在 `read_only_subpaths` ∧ 不命中 `protected_metadata_names` ∧ 不命中全局 `forbidden` 规则」。`.git/` 的保护保留为**整个子树不可写**（比只列 `.git/hooks` 更严格），不因引入该结构而放宽。
 - **快照不能放在 Agent 可写的工作目录内**：快照、回滚记录和审批状态放在独立应用状态目录，例如 `%LOCALAPPDATA%\my_agent\state\`。该目录创建时设置仅当前用户 SID 的 Windows DACL，派生文件继承同一 ACL。该目录不注册为任何 Agent 工具的根目录，Agent 无法通过写入工具覆盖快照或伪造审批状态。
 - **Windows 路径安全验收项**：除普通符号链接外，V0.4 的路径校验必须覆盖 Junction 和其他 reparse point、UNC 路径、大小写不敏感比较、不同盘符、NTFS Alternate Data Streams（如 `file.txt:stream`）；`.git`、`.venv` 等受保护目录在大小写变化（如 `.GIT`）下仍要被识别。
 - 写入前自动生成快照或 diff 记录，记录本任务修改路径；回滚由确定性服务从快照恢复，不自动执行 `git revert`/`reset`。
@@ -872,10 +877,10 @@ KEEP_RECENT_TURNS=          # 压缩后保留的原始轮数
   4. 执行文件写入。
   5. 持久化 `executing → done`。
   只有第 3 步成功前的 intent 才能安全丢弃；任何遗留的 `executing` 都按"结果未知"处理，绝不自动再次写入。启动恢复必须清理未完成快照和无 intent 引用的孤儿快照。采用临时文件 + 原子替换时，必须在 `done` 前确认目标文件已替换成功。intent 只保存路径、内容哈希、snapshot_id、快照位置等恢复所需元数据，不保存完整文件内容。
-- **工作目录外不提供"审批后由 Agent 写入"**：工具直接拒绝，并返回一条惰性建议（例如"请由用户执行：`/command ...`"）。建议文本不能触发任何执行。
-- **Agent 高风险工具默认关闭**：V0.1–V0.4 不注册任意 Shell、`git commit/push/reset/revert`、删除文件或修改系统配置。这些能力不能通过配置布尔值打开；未来 coding profile 只有在显式 capability/plugin、统一执行服务、审批、intent、审计和恢复契约全部具备后才能装配。
+- **V0.4 只提供工作目录内写入**：工具在未获批准时不得写入；目录外写入在 V0.4 一律拒绝，并返回一条惰性建议（例如"请由用户执行：`/command ...`"），建议文本不能触发任何执行。这不是永久拒绝：目录外的一次性授权升级最早随 V0.5.1 开放（见决策 8），因为审批通道（V0.5 的 TOTP/审批服务）与 pending-action 恢复边界（V0.5.1）都排在 V0.4 之后。V0.4 只**完成 grant 的数据模型与校验逻辑**，不开放目录外执行，供 V0.5.1 直接接入。
+- **Agent 高风险工具默认关闭**：V0.1–V0.4 的**默认 profile** 不注册任意 Shell、`git commit/push/reset/revert`、删除文件或修改系统配置（coding profile 的目录外一次性授权升级见决策 8，且仍不包含这些类别）。这些能力不能通过配置布尔值打开；未来 coding profile 只有在显式 capability/plugin、统一执行服务、审批、intent、审计和恢复契约全部具备后才能装配。
 - **风险操作建议机制**：Agent 遇到边界外需求时，只在回复中给出建议命令文本和风险说明，由用户判断并自行复制，通过 `/command ` 执行。Agent 输出中的 `/command ` 永远是普通文本。
-- 写入工具元数据保留风险等级（只读/写入），为以后扩展留接口；第一版不实现 Agent 侧审批恢复状态机。
+- 写入工具元数据保留风险等级（只读 / 工作目录内写入 / 目录外升级）与批准策略；Agent 侧审批恢复状态机（pending action 边界，见 9.1）随"目录外一次性授权升级"（V0.5.1）一起交付，V0.4 不交付，且在它交付之前不得开放目录外升级。工具结果类型和消息提交语义不得阻止未来增加该边界。
 - **V0.4 验收补充**：同一批次的读后写按顺序发生；两个并发写请求不能同时进入同一路径的 `executing`；锁租约过期后旧 fencing token 无法继续写；新文件回滚允许由确定性回滚服务删除本次创建的文件，这不等于向 Agent 暴露删除工具。
 
 ### V0.5：用户命令通道、TOTP 与 UU 远程
@@ -939,7 +944,7 @@ pending 或 approved 超时 → expired
   - `/approve ` 中的 TOTP 永远不持久化；命令输出正文默认不持久化。
 - **TOTP 设置**：本机 CLI `my-agent totp-setup` 生成 secret，打印 otpauth URI 和二维码；secret 本地保存、gitignored，绝不进日志。Windows 上建议用 DPAPI（当前用户范围）加密 secret 后再落盘。
 - **审计日志**：记录时间、request_id、命令哈希、退出码、耗时、`approval_method` 和成功状态；默认不记录 TOTP 和命令原文/输出正文，`AUDIT_COMMAND_BODY=true` 时才显式记录命令原文。
-- **命令生命周期 log-only**：执行前写 `command/run`（request_id、命令哈希、批准方式），结束后写 `command/done`；这些记录和审批记录一样不注入 `Conversation`，除非用户明确要求"把结果交给 Agent"。
+- **命令生命周期 log-only**：执行前写 `command/run`（request_id、命令哈希、批准方式），结束后写 `command/done`；审批问答写成对的 `approval/asked` 与 `approval/decided`（decided 携带 outcome 与 `decided_by`，outcome 含 `unavailable`），一次询问恰好对应一次结果。这些记录和审批记录一样不注入 `Conversation`，除非用户明确要求"把结果交给 Agent"。
 - **私有 spill 文件**：完整输出写到应用状态目录下的随机名 spill 文件，目录和文件继承"仅当前用户 SID"的 Windows DACL（不依赖 POSIX 0700/0600）；用户/模型只看到受限尾部，达到输出上限后截断显示但仍必须正确回收进程；spill 文件不进入审计正文。结果成功交付后立即删除 spill；异常中断时按短 TTL 保留，应用启动时清理超过 TTL 且没有活动 `request_id` 引用的孤儿 spill。清理失败记录元数据告警，但不把输出正文写入日志。
 - **正交结果字段**：`CommandResult` 分别记录 `timed_out`、`signal`、`exit_code`、`truncated`；不能因为 `exit_code=0` 就掩盖"进程其实被超时终止过"。
 - 执行前限制命令长度；执行期间持续读取 stdout/stderr。超时执行必须终止整个进程树：Windows 首选 Job Object，`taskkill /PID <pid> /T /F` 作为回退；任务不存在、竞态和回退失败都要被包含，不能阻塞正常结果返回。
@@ -955,13 +960,21 @@ pending 或 approved 超时 → expired
 这一阶段不是给默认 Agent 增加一个 `ALLOW_SHELL` 开关，而是证明同一个无状态 Agent 核心可以通过插件组合成 coding agent。默认 profile 不注册 Shell；coding profile 由应用组装层显式选择工具集合、能力策略和执行服务。
 
 - **插件边界**：`ShellToolPlugin` 只负责把模型的结构化工具调用转换成 `AgentActionRequest`；不得在工具函数内部直接散落 `subprocess`、PowerShell 或 `cmd` 调用。真正的进程启动、环境清洗、超时、输出限制和进程树终止全部复用 V0.5 的 `CommandExecutionService`。
-- **审批边界**：模型不能自己批准自己的 Shell 请求。Shell tool-call 先产生稳定的 `request_id + tool_call_id` 和待审批状态；CLI、QQ、SSH 或桌面适配器通过统一审批服务确认后，才允许执行并恢复原 Agent 轮次。没有可恢复的 pending-action 状态时，插件只能返回“请用户使用 `/command `”的建议，不得假装命令已经执行。
-- **能力策略**：coding profile 的工具描述必须声明 `effect=host_command`、是否需要用户批准、工作目录约束、超时、输出上限和是否允许重试。Shell 默认关闭；启用必须在组合根显式注入 policy/plugin，不能由模型消息、工具结果或普通环境变量临时打开。
-- **结果协议**：命令执行结果必须区分 `pending_approval`、`denied`、`succeeded`、`failed`、`timed_out`、`interrupted`、`unknown` 和 `truncated` 等状态；不能把超时、进程已启动但结果丢失或用户拒绝压成普通成功 `ToolMessage`。恢复后仍须保留原始 AI tool-call，并只为该 `tool_call_id` 提交一个结果。
+- **审批边界**：模型不能自己批准自己的 Shell 请求。Shell tool-call 先产生稳定的 `request_id + tool_call_id` 和待审批状态；CLI、QQ、SSH 或桌面适配器通过统一审批服务确认后，才允许执行并恢复原 Agent 轮次。没有可恢复的 pending-action 状态时，插件只能返回“请用户使用 `/command `”的建议，不得假装命令已经执行。审批服务只依赖决策者链的结果（`allow-once` / `rejected` / `unavailable` / `defer`，见决策 21），**不依赖"决策者一定是人"**：当前链上只有人类适配器一个决策者，`defer` 仅表示保持在 `pending` 并交给下一个决策者，因此不需要新增状态；以后加入自动审批只新增一个决策者实现，不改状态机、执行器和审计格式。裁决一律记录 `decided_by`。
+- **状态机分层（三套，不合并）**：`CommandExecutionService`（进程控制层：解释器选择、环境清洗、超时、输出限制、进程树终止，**两通道共用**）；`CommandRequest` 状态机（用户通道：TOTP、免输码窗口、重放保护、失败锁定）；`AgentActionRequest` 状态机（Agent 通道：`tool_call_id`、决策者链、逐操作 grant）。三者共享 executor 与审计格式，**不共享状态机、不共享批准语义**；Agent 通道的请求**绝不进入** `CommandRequest` 的免输码窗口（见决策 20）。
+- **模型主动升权（阶梯式，严格受控）**：coding profile 的 Shell 工具可以声明 `sandbox_permissions`（目标模式）与 `justification`（一句话理由）两个可选参数，使模型在权限不足时**原地请求一次更宽的模式**，而不是只能回落到建议文本。硬约束：升权**只在执行时**对照“本次调用的有效 mode”判定，**绝不写进工具 schema**（schema 的枚举只是封闭的目标词汇 `{workspace-write, danger-full-access}`，因为 schema 是注册表全局的、而有效 mode 是逐调用的既成事实）；**必须严格更宽**（`read-only → workspace-write | danger-full-access`，`workspace-write → danger-full-access`，其余组合一律拒绝）；`sandbox_permissions` 与 `justification` **必须成对出现**且理由是**非空句子**；**非加宽请求连人都不询问就直接拒绝**；批准只对该次调用生效（`allowed-once`），不产生常驻授权。被拒绝、被取消、审批通道不可用必须映射到**三个不同的结果文本**，且全部在**任何执行发生之前**完成判定。
+- **能力策略**：coding profile 的工具描述必须声明 `effect=host_command`、是否需要用户批准、工作目录约束、超时、输出上限和是否允许重试。Shell 默认关闭；启用必须在组合根显式注入 policy/plugin，不能由模型消息、工具结果或普通环境变量临时打开。`effect=host_command` 的 **`retryable` 恒为 `false`**（非幂等副作用；已启动但结果未知时重试等于造成第二次真实副作用），且声明的超时必须由执行服务**强制执行到整棵进程树**，工具**不得在进程到达终态前返回**（“声明了超时”与“强制了超时”是两件事）。
+- **结果协议**：命令执行结果必须区分 `pending_approval`、`denied`、`unavailable`、`succeeded`、`failed`、`timed_out`、`interrupted`、`unknown` 和 `truncated` 等状态；不能把超时、进程已启动但结果丢失或用户拒绝压成普通成功 `ToolMessage`。**`unavailable`（审批通道不可用）必须与 `denied`（用户明确拒绝）区分开**：两者都 fail closed，但把"没人能批准"压成"用户不同意"会破坏诊断、恢复和审计。恢复后仍须保留原始 AI tool-call，并只为该 `tool_call_id` 提交一个结果。
 - **历史与恢复**：执行前先持久化 intent/审批状态；Agent、Conversation 和命令服务之间通过稳定 request ID 关联。应用崩溃后，遗留 `executing` 命令标为结果未知，禁止自动重试；下一轮只能向用户报告并等待明确的新请求。
 - **编码工具集合**：coding profile 可以逐步装配只读文件工具、Git 只读工具、工作目录写入工具和 Shell tool，但每类能力都必须有独立 capability metadata。Shell 不能因为已启用就自动获得目录外写入、删除、Git 历史改写或系统配置权限。
 - **安全执行约束**：沿用 V0.5 的固定解释器、非交互限制、环境变量清洗、命令长度限制、stdout/stderr 上限、Windows Job Object/进程树终止、敏感输出脱敏和审计规则。Shell plugin 不复制另一套安全策略。
-- **验收**：验证默认 profile 完全没有 Shell tool；coding profile 可发现 Shell tool 但未审批不能执行；批准后消息顺序仍满足 AI tool-call/ToolMessage 协议；拒绝、超时、取消、崩溃恢复和结果未知都可恢复；Agent 输出的 `/command ` 文本仍不会触发执行；多个适配器复用同一个执行服务而不复制逻辑。
+- **V0.4 的路径策略不约束 shell 子进程**：V0.4 的真实路径校验、逐级 lstat、reparse point 拒绝、`WritableRoot` 与受保护子树，保护的都是 **Agent 的写入工具（进程内）**；一旦引入 Shell，子进程自己就能写任何该用户可写的路径，**完全绕过它们**。因此 **Agent Shell 的文件边界必须由 OS 后端独立提供**（受限身份 / ACL / AppContainer），`cwd` 与“工作目录约束”只是初始目录、**不是安全边界**；`read-only`/`workspace-write` 对 Shell 的语义只能由后端兑现，不得依赖路径字符串校验。
+- **策略决议与执行器分离**：`PolicyResolver.resolve()` 在每次操作边界决议一次，优先级为「本次已批准 grant > 当前 profile/session mode > 部署默认」；`Executor` 只接收已决议完成的执行计划，不保存 mode、不自行决定是否需要审批。**executor 只接受由 `PolicyResolver` 铸造的“已决议计划”令牌**（一次性、绑定本次操作身份、调用方无法构造），使“必须调用 resolver”变成“**不经过 resolver 就无法 spawn**”——仅约定“插件要记得调用”不足够：AutoGPT 的 server 模式正是因为在**调用点**而非服务边界做检查而整段绕过了权限层，未来的子代理、批量工具或计划任务同样会绕过。该 resolver **只服务 Agent 工具能力**；用户 `/command ` 的 TOTP、grace window 和 `CommandRequest` 状态机仍属于独立的命令服务，两条通道不合并成一个 resolver。V0.1–V0.5 的 mode 由组合根或 `Conversation` 持有的不可变 profile policy 决定；V0.6 若允许动态切换模式，再把模式切换纳入事件日志与恢复语义。
+- **网络策略（仅约束 Agent 发起的工具/Shell）**：`SandboxPolicy.network_access` 默认 `restricted`，由 `PolicyResolver` 纳入决议——但**策略表达不等于强制机制**：策略字段是一层，Windows 防火墙/WFP/AppContainer/受管代理或更强后端是另一层。强制要求：执行后端必须能证明它确实落实了该决议；**当前后端无法表达网络限制时，必须拒绝执行或改选更强后端，绝不允许出现“策略显示 restricted、子进程实际仍可联网”**；不能只靠环境变量清洗或 Python 层字符串检查。**每次执行必须报告执行完整度 `full | partial`**：`full` 表示后端治理了它承诺的每一项效果，`partial` 表示只治理了其中一部分（Windows 的 ACL 受限 token 就属于 `partial`——它必须保留 `Everyone`、NTFS 硬链接会把同一文件对象跨路径别名，而且它只交叉写权限、不覆盖读与网络）。要求绝对边界的调用方**必须能够拒绝 `partial`**，不得把 `full` 当作默认假设。测试必须覆盖 DNS、IPv4/IPv6、代理、重定向和子进程继承。**在能证明“Shell 子进程无法出站”之前，Shell capability 保持关闭并在计划中标记为未实现**，不得把“默认无网络”当作已成立的安全事实。模型客户端自身的网络访问和**用户经 TOTP 显式执行的 `/command ` 不属于该限制**（V0.5 已规定其允许管道、重定向、PowerShell、Git 等任意非交互命令）。
+- **Windows 执行门槛（Shell 启用前置条件，不提前到 V0.4）**：`restricted token` 只能作为**写权限收缩手段之一**，不得默认视为已落实读隔离或网络隔离；`Job Object` 只解决进程树生命周期，`DACL` 只解决一部分对象访问，二者都不等于权限沙盒。启用 `ShellToolPlugin` 之前，必须通过 Windows POC **选择一个能满足当前 `SandboxPolicy`（文件 + 网络）的执行后端**；后端无法表达所需策略时一律 fail closed，**绝不自动降级为完整 token**。具体 flags、restricting SID 列表、默认 DACL 的最小授权和 PowerShell 所需 trustee 由 POC 实测确定，不得照搬外部项目取值，也不得使用泛化的“广泛 full access”；POC 必须证明所选后端与管道 stdio、PowerShell 启动、Job Object、状态目录 DACL 可共存。V0.4 的文件写入由路径校验、快照、intent 和 DACL 保护且不引入子进程，因此不受此门槛约束；除非 V0.4 的写入执行器后来决定使用子进程，否则不提前引入进程 token 基础设施。
+- **grant 的 canonical identity 必须唯一**：grant 创建、审批展示、策略匹配和最终执行必须使用同一种 canonical target identity；执行前重新解析并与 grant 记录比较，路径身份、内容哈希或操作类型任一变化即令旧 grant 失效。这里继续沿用 V0.4 更严格的 Windows 路径防护（逐级 lstat、reparse point 拒绝、打开前复验、句柄反查），**不得用外部项目较弱的 `Path.resolve()` 实现替换它**。
+- **一次性授权的验收（完成条件，不是可选测试）**：已消费/过期/撤销的 grant 必须立即失效；旧 grant 不能用于写新路径或新内容（路径与内容哈希绑定必须生效）；同一路径的并发授权只有一个能进入 `executing`；未批准、被拒绝或超时后绝不产生任何副作用。`mode` 降级泄漏测试与 `C:\Users\Public` 一类 ambient-writable 逃逸测试属于 OS 沙盒/token 落地后的测试，不提前当作路径策略的通用测试。
+- **验收**：验证默认 profile 完全没有 Shell tool；coding profile 可发现 Shell tool 但未审批不能执行；批准后消息顺序仍满足 AI tool-call/ToolMessage 协议；拒绝、超时、取消、崩溃恢复和结果未知都可恢复；Agent 输出的 `/command ` 文本仍不会触发执行；多个适配器复用同一个执行服务而不复制逻辑。补充断言：**审批通道不可用必须返回 `unavailable` 而不是 `denied`**；**用户通道的免输码窗口不得使任何 Agent 请求免批**；升权请求必须严格更宽，且非加宽请求**不触发任何询问**；执行完整度为 `partial` 时调用方可以拒绝。
 
 ### V0.5.5：SSH 远程管理通道（可靠备用通道）
 
@@ -1032,6 +1045,9 @@ L1 规则层：项目规则、安全边界、Agent 默认禁止清单与 coding 
    项目规则：WORKSPACE_ROOT/AGENTS.md
       承载当前项目的规范；属于项目仓库，可随项目 Git 审查；
       文件读取工具可读，Agent 写入工具永久拒绝修改
+    ⚠️ 这两个文件只承载人类可读的说明与建议，不构成执行边界；
+      allow/prompt/forbidden 的权威定义在 PolicyResolver 的策略源（见决策 22），
+      二者不得互相替代，项目内文件永不净放宽策略
 
 L2 常驻层：用户稳定偏好、长期目标、已确认的稳定事实
    加载：每次任务开始时注入少量高密度条目，设数量上限
@@ -1084,4 +1100,4 @@ feat: add interactive cli
 chore: add logging and documentation
 ```
 
-不要采用"写完所有模块再测试"的方式。当前最重要的成果不是 QQ、桌面端或文件修改，而是一个可以被假模型完全测试、又能用真实 DeepSeek 跑通工具调用的最小 Agent 核心，以及归属清晰的多轮短期记忆。
+不要采用"写完所有模块再测试"的方式。当前最重要的成果不是 QQ、桌面端或文件修改，而是一个可以被假模型完全测试、又能用 OpenAI 兼容模型服务跑通工具调用的最小 Agent 核心，以及归属清晰的多轮短期记忆。

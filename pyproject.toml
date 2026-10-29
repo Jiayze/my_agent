@@ -23,7 +23,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [project.scripts]
-my-agent = "my_agent.main:main"
+my-agent = "my_agent.main:run"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
