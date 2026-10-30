@@ -11,6 +11,7 @@ from typing import Protocol
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from my_agent.agent import Agent
+from my_agent.compaction import SummarizingCompactor
 from my_agent.config import (
     DEFAULT_ENV_PATH,
     AgentConfig,
@@ -23,7 +24,7 @@ from my_agent.llm import ModelInitializationError, create_chat_model
 from my_agent.logging_setup import HANDLER_MARKER, configure_logging
 from my_agent.models import AgentResult
 from my_agent.prompts import SYSTEM_PROMPT
-from my_agent.tools import ToolRegistry, get_tools
+from my_agent.tools import ToolRegistry, get_coding_tools, get_tools
 
 logger = logging.getLogger(__name__)
 
@@ -48,38 +49,102 @@ class ChatConversation(Protocol):
         ...
 
 
+def _default_tools_factory(config: AgentConfig) -> ToolRegistry:
+    """默认工具装配：工作目录只读工具 + 可选知识库检索"""
+    return get_tools(
+        config.workspace_root,
+        knowledge_base_root=config.knowledge_base_root,
+    )
+
+
+def _coding_tools_factory(
+    config: AgentConfig,
+    state_dir: Path | None,
+) -> ToolRegistry:
+    """coding profile 工具装配：只读工具 + 工作目录内写入（V0.4）"""
+    from my_agent.side_effects.state_dir import default_state_root
+
+    return get_coding_tools(
+        config.workspace_root,
+        state_dir=state_dir if state_dir is not None else default_state_root(),
+        write_max_bytes=config.write_max_bytes,
+    )
+
+
+def _create_summarizer(config: AgentConfig) -> BaseChatModel:
+    """创建 V0.2 独立摘要模型：temperature=0、不绑定工具"""
+    return create_chat_model(
+        config,
+        model_id=config.summarizer_model_id,
+        base_url=config.summarizer_base_url,
+        api_key=config.summarizer_api_key,
+        temperature=0,
+    )
+
+
 def build_conversation(
     config: AgentConfig,
     *,
+    profile: str = "default",
+    state_dir: Path | None = None,
     model_factory: Callable[[AgentConfig], BaseChatModel] | None = None,
-    tools_factory: Callable[[], ToolRegistry] | None = None,
+    summarizer_factory: Callable[[AgentConfig], BaseChatModel] | None = None,
+    tools_factory: Callable[[AgentConfig], ToolRegistry] | None = None,
     agent_factory: Callable[..., Agent] | None = None,
     conversation_factory: Callable[..., Conversation] | None = None,
 ) -> Conversation:
     """按 M6.1 启动顺序装配模型、工具、Agent 与 Conversation
 
     默认工厂在函数体内解析，测试可以注入假模型和假装配函数而不访问网络。
+    V0.2 起对话默认装配 token 压力感知的 ``SummarizingCompactor``，
+    摘要模型缺省回落主模型，可以与主模型相同也可以不同。
+    ``profile="coding"`` 显式装配工作目录内写入能力（V0.4）；
+    默认 profile 不装配任何写入工具。
     """
+    if profile == "default":
+        default_tools_factory: Callable[[AgentConfig], ToolRegistry] = (
+            _default_tools_factory
+        )
+    elif profile == "coding":
+
+        def default_tools_factory(config: AgentConfig) -> ToolRegistry:
+            return _coding_tools_factory(config, state_dir)
+
+    else:
+        raise ValueError(f"unknown profile: {profile!r}")
+
     if model_factory is None:
         model_factory = create_chat_model
+    if summarizer_factory is None:
+        summarizer_factory = _create_summarizer
     if tools_factory is None:
-        tools_factory = get_tools
+        tools_factory = default_tools_factory
     if agent_factory is None:
         agent_factory = Agent
     if conversation_factory is None:
         conversation_factory = Conversation
 
     model = model_factory(config)
-    tools = tools_factory()
+    # 工作区根只从已校验的配置注入；模型无法修改工具绑定的根目录
+    tools = tools_factory(config)
     agent = agent_factory(
         model=model,
         tools=tools,
         max_tool_rounds=config.max_tool_rounds,
+        max_stall_rounds=config.max_stall_rounds,
+    )
+    summarizer = summarizer_factory(config)
+    compactor = SummarizingCompactor(
+        summarizer,
+        target_tokens=config.context_target_tokens,
+        hard_limit_tokens=config.context_hard_limit_tokens,
+        keep_recent_turns=config.keep_recent_turns,
     )
     return conversation_factory(
         conversation_id=CONVERSATION_ID,
         agent=agent,
         system_prompt=SYSTEM_PROMPT,
+        context_compactor=compactor,
     )
 
 

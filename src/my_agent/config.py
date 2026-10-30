@@ -29,6 +29,21 @@ VALID_REASONING_EFFORTS = ("low", "high", "max")
 DEFAULT_REASONING_EFFORT = "high"
 """官方默认推理强度；仅在 thinking_enabled 时才会发送"""
 
+DEFAULT_CONTEXT_TARGET_TOKENS = 32_000
+"""V0.2 上下文压缩的软阈值，达到后触发压缩"""
+
+DEFAULT_CONTEXT_HARD_LIMIT_TOKENS = 48_000
+"""V0.2 硬上限，超过后只允许硬截断"""
+
+DEFAULT_KEEP_RECENT_TURNS = 3
+"""V0.2 压缩后保留的原始完整轮数"""
+
+DEFAULT_MAX_STALL_ROUNDS = 3
+"""V0.3 进度账本防卡死的连续重复轮数阈值"""
+
+DEFAULT_WRITE_MAX_BYTES = 1024 * 1024
+"""V0.4 单次写入内容的字节上限"""
+
 _THINKING_VALUES = {"enabled": True, "disabled": False}
 
 UNPRINTABLE_URL = "<redacted-url>"
@@ -175,6 +190,40 @@ def _require_reasoning_effort(value: object) -> str:
     return normalized
 
 
+def _require_directory(value: object, field: str) -> Path:
+    """校验路径存在且确实是目录并返回规范化路径"""
+    if not isinstance(value, Path):
+        raise ConfigurationError(field, "must be a path")
+    try:
+        resolved = value.expanduser().resolve()
+        file_stat = resolved.stat()
+    except (OSError, RuntimeError) as error:
+        raise ConfigurationError(
+            field,
+            f"could not be accessed: {value}",
+        ) from error
+    if not S_ISDIR(file_stat.st_mode):
+        raise ConfigurationError(field, f"is not a directory: {resolved}")
+    return resolved
+
+
+def _require_disjoint(first: Path, second: Path, field: str) -> None:
+    """要求两个真实目录互不包含（任一方向嵌套都拒绝）"""
+    for parent, child in ((first, second), (second, first)):
+        try:
+            common = os.path.commonpath(
+                [os.path.normcase(str(parent)), os.path.normcase(str(child))]
+            )
+        except ValueError as error:  # 不同盘符视为不相交
+            del error
+            continue
+        if common == os.path.normcase(str(parent)):
+            raise ConfigurationError(
+                field,
+                "must be separate from the workspace root",
+            )
+
+
 def _split_url(url: str) -> SplitResult | None:
     """解析 URL，无法解析时返回 None 而不是抛出异常"""
     try:
@@ -263,6 +312,15 @@ class AgentConfig:
     log_level: str
     thinking_enabled: bool = False
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    summarizer_model_id: str | None = None
+    summarizer_base_url: str | None = None
+    summarizer_api_key: str | None = None
+    context_target_tokens: int = DEFAULT_CONTEXT_TARGET_TOKENS
+    context_hard_limit_tokens: int = DEFAULT_CONTEXT_HARD_LIMIT_TOKENS
+    keep_recent_turns: int = DEFAULT_KEEP_RECENT_TURNS
+    max_stall_rounds: int = DEFAULT_MAX_STALL_ROUNDS
+    knowledge_base_root: Path | None = None
+    write_max_bytes: int = DEFAULT_WRITE_MAX_BYTES
 
     def __post_init__(self) -> None:
         """校验并规范化所有配置字段"""
@@ -309,6 +367,98 @@ class AgentConfig:
             "reasoning_effort",
             _require_reasoning_effort(self.reasoning_effort),
         )
+        # V0.2 摘要模型缺省回落主模型；显式提供时沿用同一套字符串校验
+        if self.summarizer_model_id is None:
+            object.__setattr__(self, "summarizer_model_id", self.model_id)
+        else:
+            object.__setattr__(
+                self,
+                "summarizer_model_id",
+                _require_string("summarizer_model_id", self.summarizer_model_id),
+            )
+        if self.summarizer_base_url is None:
+            object.__setattr__(self, "summarizer_base_url", self.base_url)
+        else:
+            object.__setattr__(
+                self,
+                "summarizer_base_url",
+                _require_string("summarizer_base_url", self.summarizer_base_url),
+            )
+        if self.summarizer_api_key is None:
+            object.__setattr__(self, "summarizer_api_key", self.api_key)
+        else:
+            object.__setattr__(
+                self,
+                "summarizer_api_key",
+                _require_string("summarizer_api_key", self.summarizer_api_key),
+            )
+        object.__setattr__(
+            self,
+            "context_target_tokens",
+            _require_integer(
+                "context_target_tokens",
+                self.context_target_tokens,
+                minimum=1000,
+                maximum=1_000_000,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "context_hard_limit_tokens",
+            _require_integer(
+                "context_hard_limit_tokens",
+                self.context_hard_limit_tokens,
+                minimum=1000,
+                maximum=2_000_000,
+            ),
+        )
+        if self.context_hard_limit_tokens < self.context_target_tokens:
+            raise ConfigurationError(
+                "context_hard_limit_tokens",
+                "must be greater than or equal to context_target_tokens",
+            )
+        object.__setattr__(
+            self,
+            "keep_recent_turns",
+            _require_integer(
+                "keep_recent_turns",
+                self.keep_recent_turns,
+                minimum=1,
+                maximum=50,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_stall_rounds",
+            _require_integer(
+                "max_stall_rounds",
+                self.max_stall_rounds,
+                minimum=2,
+                maximum=5,
+            ),
+        )
+        if self.knowledge_base_root is not None:
+            knowledge_root = _require_directory(
+                self.knowledge_base_root,
+                "knowledge_base_root",
+            )
+            # 知识库目录只读且必须与工作目录分离，任一方向嵌套都拒绝
+            _require_disjoint(
+                self.workspace_root,
+                knowledge_root,
+                "knowledge_base_root",
+            )
+            object.__setattr__(self, "knowledge_base_root", knowledge_root)
+        object.__setattr__(
+            self,
+            "write_max_bytes",
+            _require_integer(
+                "write_max_bytes",
+                self.write_max_bytes,
+                minimum=1,
+                maximum=16 * 1024 * 1024,
+            ),
+        )
 
     def safe_summary(self) -> dict[str, object]:
         """返回不含 API key 和 URL 凭据的启动诊断摘要
@@ -326,6 +476,18 @@ class AgentConfig:
             "log_level": self.log_level,
             "thinking_enabled": self.thinking_enabled,
             "reasoning_effort": self.reasoning_effort,
+            "summarizer_model_id": self.summarizer_model_id,
+            "summarizer_base_url": safe_url_summary(self.summarizer_base_url),
+            "context_target_tokens": self.context_target_tokens,
+            "context_hard_limit_tokens": self.context_hard_limit_tokens,
+            "keep_recent_turns": self.keep_recent_turns,
+            "max_stall_rounds": self.max_stall_rounds,
+            "knowledge_base_root": (
+                str(self.knowledge_base_root)
+                if self.knowledge_base_root is not None
+                else None
+            ),
+            "write_max_bytes": self.write_max_bytes,
             "api_key_configured": True,
         }
 
@@ -452,6 +614,29 @@ def _parse_reasoning_effort(environment: Mapping[str, str | None]) -> str:
     return normalized
 
 
+def _parse_optional_secret(
+    environment: Mapping[str, str | None],
+    name: str,
+) -> str | None:
+    """读取可选密钥配置；显式提供的空值视为未配置"""
+    raw_value = environment.get(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    if not isinstance(raw_value, str):
+        raise ConfigurationError(name, "must be a string")
+    return raw_value.strip()
+
+
+def _parse_knowledge_base_root(
+    environment: Mapping[str, str | None],
+) -> Path | None:
+    """读取可选知识库目录；未配置时返回 None（工具不注册）"""
+    raw_value = _read_optional(environment, "KNOWLEDGE_BASE_ROOT", "")
+    if not raw_value:
+        return None
+    return Path(raw_value)
+
+
 def load_config(
     env_file: str | Path | None = DEFAULT_ENV_PATH,
     *,
@@ -498,6 +683,52 @@ def load_config(
             log_level=_read_optional(merged, "LOG_LEVEL", "INFO"),
             thinking_enabled=_parse_thinking_enabled(merged),
             reasoning_effort=_parse_reasoning_effort(merged),
+            summarizer_model_id=(
+                _read_optional(merged, "SUMMARIZER_MODEL_ID", "") or None
+            ),
+            summarizer_base_url=(
+                _read_optional(merged, "SUMMARIZER_MODEL_BASE_URL", "") or None
+            ),
+            summarizer_api_key=_parse_optional_secret(
+                merged,
+                "SUMMARIZER_MODEL_API_KEY",
+            ),
+            context_target_tokens=_parse_integer(
+                merged,
+                "CONTEXT_TARGET_TOKENS",
+                str(DEFAULT_CONTEXT_TARGET_TOKENS),
+                minimum=1000,
+                maximum=1_000_000,
+            ),
+            context_hard_limit_tokens=_parse_integer(
+                merged,
+                "CONTEXT_HARD_LIMIT_TOKENS",
+                str(DEFAULT_CONTEXT_HARD_LIMIT_TOKENS),
+                minimum=1000,
+                maximum=2_000_000,
+            ),
+            keep_recent_turns=_parse_integer(
+                merged,
+                "KEEP_RECENT_TURNS",
+                str(DEFAULT_KEEP_RECENT_TURNS),
+                minimum=1,
+                maximum=50,
+            ),
+            max_stall_rounds=_parse_integer(
+                merged,
+                "MAX_STALL_ROUNDS",
+                str(DEFAULT_MAX_STALL_ROUNDS),
+                minimum=2,
+                maximum=5,
+            ),
+            knowledge_base_root=_parse_knowledge_base_root(merged),
+            write_max_bytes=_parse_integer(
+                merged,
+                "WRITE_MAX_BYTES",
+                str(DEFAULT_WRITE_MAX_BYTES),
+                minimum=1,
+                maximum=16 * 1024 * 1024,
+            ),
         )
     except ConfigurationError as error:
         field_names = {
@@ -511,6 +742,15 @@ def load_config(
             "log_level": "LOG_LEVEL",
             "thinking_enabled": "CHAT_MODEL_THINKING",
             "reasoning_effort": "CHAT_MODEL_REASONING_EFFORT",
+            "summarizer_model_id": "SUMMARIZER_MODEL_ID",
+            "summarizer_base_url": "SUMMARIZER_MODEL_BASE_URL",
+            "summarizer_api_key": "SUMMARIZER_MODEL_API_KEY",
+            "context_target_tokens": "CONTEXT_TARGET_TOKENS",
+            "context_hard_limit_tokens": "CONTEXT_HARD_LIMIT_TOKENS",
+            "keep_recent_turns": "KEEP_RECENT_TURNS",
+            "max_stall_rounds": "MAX_STALL_ROUNDS",
+            "knowledge_base_root": "KNOWLEDGE_BASE_ROOT",
+            "write_max_bytes": "WRITE_MAX_BYTES",
         }
         public_field = field_names.get(error.field, error.field)
         if public_field == error.field:

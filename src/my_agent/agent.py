@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 import traceback
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -23,6 +26,7 @@ from langgraph.graph.message import MessagesState
 from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from langgraph.runtime import Runtime
+from pydantic import ValidationError
 
 from my_agent.models import AgentResult, AgentRunContext, ModelProtocolError
 from my_agent.tools.registry import ToolRegistry
@@ -35,6 +39,9 @@ _SAFE_TOOL_ROUND_LIMIT_MESSAGE = "已达到工具调用轮数上限，该工具�
 _SAFE_TOOL_EXECUTION_FAILED_MESSAGE = "工具执行失败，该工具未完成。"
 _SAFE_TOOL_INPUT_MESSAGE = "工具参数无效，请根据工具参数 schema 修正后重试。"
 _SAFE_RECURSION_MESSAGE = "Agent 执行达到框架安全上限，请稍后重试。"
+_SAFE_STALL_MESSAGE = (
+    "检测到连续多轮重复的相同工具调用，已停止本轮执行；请调整提问或参数后重试。"
+)
 
 
 def _is_expected_model_error(error: Exception) -> bool:
@@ -86,8 +93,8 @@ def _handle_tool_error(error: ToolException) -> str:
     return _SAFE_TOOL_EXECUTION_FAILED_MESSAGE
 
 
-def _require_read_only_tools(tools: Sequence[BaseTool]) -> None:
-    """V0.1 只执行显式声明 effect 且为只读的工具"""
+def _require_tool_effects(tools: Sequence[BaseTool]) -> None:
+    """每个工具必须声明显式 effect；V0.4 接受只读与工作目录内写入"""
     for tool in tools:
         metadata = tool.metadata or {}
         if "effect" not in metadata:
@@ -95,11 +102,97 @@ def _require_read_only_tools(tools: Sequence[BaseTool]) -> None:
                 f"tool {tool.name!r} must declare an explicit 'effect' metadata"
             )
         effect = metadata["effect"]
-        if effect != "read_only":
+        if effect not in ("read_only", "workspace_write"):
             raise ValueError(
                 f"tool {tool.name!r} requires a side-effect execution policy; "
                 f"got effect: {effect!r}"
             )
+
+
+def _canonical_arguments(args: object) -> str:
+    """深键排序 + 紧凑序列化：对象属性顺序不同视为同一调用"""
+    try:
+        return json.dumps(
+            args,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        )
+    except (TypeError, ValueError):
+        return repr(args)
+
+
+def _sha256(text: str) -> str:
+    """返回十六进制 SHA-256 摘要"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProgressRecord:
+    """单轮工具调用的进度账本记录
+
+    ``stall_signature`` 只由规范化后的 ``tool_names + args_digest +
+    results_digest`` 计算；不包含轮次、时间戳、调用 ID、随机 ID 或
+    ``final_reply`` 等每轮必然变化的字段，否则永远不会重复。
+    ``current_goal`` / ``current_subtask`` 是为后续版本保留的元数据槽位。
+    """
+
+    round_index: int
+    tool_names: tuple[str, ...]
+    args_digest: str
+    results_digest: str
+    stall_signature: str
+    current_goal: str = ""
+    current_subtask: str = ""
+    final_reply: str = ""
+
+
+def build_progress_record(
+    round_index: int,
+    tool_calls: Sequence[dict[str, Any]],
+    results_by_id: dict[str, ToolMessage],
+) -> ProgressRecord:
+    """由本轮工具调用与结果构造进度记录
+
+    并行工具调用先按 ``(name, args_digest, results_digest)`` 确定性排序再
+    合并；被拒绝或执行失败的调用同样计数（错误状态参与结果摘要）。
+    """
+    entries: list[tuple[str, str, str]] = []
+    names: list[str] = []
+    for call in tool_calls:
+        name = str(call.get("name", "unknown"))
+        arguments = _canonical_arguments(call.get("args"))
+        args_digest = _sha256(arguments)
+        result = results_by_id.get(str(call.get("id", "")))
+        if result is None:
+            result_digest = _sha256("missing_result")
+        else:
+            result_digest = _sha256(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "content": _normalize_content(result.content),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        entries.append((name, args_digest, result_digest))
+        names.append(name)
+
+    ordered = sorted(entries)
+    args_digest = _sha256(_canonical_arguments([entry[1] for entry in ordered]))
+    results_digest = _sha256(_canonical_arguments([entry[2] for entry in ordered]))
+    signature = _sha256(_canonical_arguments(ordered))
+    return ProgressRecord(
+        round_index=round_index,
+        tool_names=tuple(sorted(names)),
+        args_digest=args_digest,
+        results_digest=results_digest,
+        stall_signature=signature,
+    )
 
 
 def _build_closers(
@@ -151,6 +244,8 @@ class AgentState(MessagesState):
 
     tool_rounds: int
     terminal_error: str | None
+    progress_log: list[ProgressRecord]
+    stalled: bool
 
 
 class Agent:
@@ -161,34 +256,42 @@ class Agent:
         model: BaseChatModel,
         tools: Sequence[BaseTool] | ToolRegistry,
         max_tool_rounds: int,
+        max_stall_rounds: int = 3,
     ) -> None:
         """初始化无状态 Agent 并绑定模型工具和执行轮数上限"""
         if isinstance(max_tool_rounds, bool) or not isinstance(max_tool_rounds, int):
             raise ValueError("max_tool_rounds must be an integer >= 1")
         if max_tool_rounds < 1:
             raise ValueError("max_tool_rounds must be >= 1")
+        if isinstance(max_stall_rounds, bool) or not isinstance(max_stall_rounds, int):
+            raise ValueError("max_stall_rounds must be an integer >= 2")
+        if max_stall_rounds < 2:
+            raise ValueError("max_stall_rounds must be >= 2")
 
         registry = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
         self._tools = tuple(registry.get_tools())
-        _require_read_only_tools(self._tools)
+        _require_tool_effects(self._tools)
+        self._tool_by_name = {tool.name: tool for tool in self._tools}
         self._max_tool_rounds = max_tool_rounds
+        self._max_stall_rounds = max_stall_rounds
         self._bound_model = model.bind_tools(self._tools)
         self._tools_node = ToolNode(
             self._tools,
             handle_tool_errors=False,
             wrap_tool_call=self._wrap_tool_call,
         )
-        # 每轮依次经过 model tools increment 再回到 model
+        # 每轮依次经过 model tools increment record_progress 再回到 model
         # 最后由模型完成回答或由闭合节点结束
         self._recursion_limit = max(25, 3 * max_tool_rounds + 5)
         self._graph = self._build_graph()
 
     def _build_graph(self) -> Any:
-        """构建模型工具执行轮数统计和未执行调用闭合组成的状态图"""
+        """构建模型工具执行轮数统计进度账本和未执行调用闭合组成的状态图"""
         builder = StateGraph(AgentState, context_schema=AgentRunContext)
         builder.add_node("model", self._model_node)
         builder.add_node("tools", self._tools_node_fn)
         builder.add_node("increment_tool_rounds", self._increment_tool_rounds)
+        builder.add_node("record_progress", self._record_progress)
         builder.add_node("close_unexecuted_tools", self._close_unexecuted_tools)
 
         builder.add_edge(START, "model")
@@ -206,7 +309,12 @@ class Agent:
             self._route_after_tools,
             {"increment": "increment_tool_rounds", END: END},
         )
-        builder.add_edge("increment_tool_rounds", "model")
+        builder.add_edge("increment_tool_rounds", "record_progress")
+        builder.add_conditional_edges(
+            "record_progress",
+            self._route_after_record,
+            {"model": "model", END: END},
+        )
         builder.add_edge("close_unexecuted_tools", END)
         return builder.compile()
 
@@ -221,6 +329,8 @@ class Agent:
             "messages": list(messages),
             "tool_rounds": 0,
             "terminal_error": None,
+            "progress_log": [],
+            "stalled": False,
         }
         config: RunnableConfig = {"recursion_limit": self._recursion_limit}
 
@@ -264,6 +374,7 @@ class Agent:
                 "model_error": _SAFE_MODEL_ERROR_MESSAGE,
                 "empty_model_response": _SAFE_EMPTY_MODEL_MESSAGE,
                 "tool_round_limit": _SAFE_TOOL_ROUND_LIMIT_MESSAGE,
+                "agent_stall": _SAFE_STALL_MESSAGE,
             }.get(terminal_error, _SAFE_TOOL_EXECUTION_FAILED_MESSAGE)
             return self._failure_result(
                 final_messages,
@@ -386,19 +497,84 @@ class Agent:
     ) -> dict[str, Any]:
         """执行当前状态中的工具调用
 
-        每个工具的耗时和结果状态由 ``_wrap_tool_call`` 统一记录。
+        纯只读批次复用 ToolNode 的默认调度；只要本批包含任何写工具，
+        整批就按模型返回顺序串行执行（V0.4 副作用感知执行器），
+        禁止读写同一路径时出现先后不确定。
         """
+        messages = state["messages"]
+        last = messages[-1] if messages else None
+        if (
+            isinstance(last, AIMessage)
+            and last.tool_calls
+            and self._batch_has_write_tool(last.tool_calls)
+        ):
+            return self._execute_write_batch_serially(last.tool_calls, config)
         return self._tools_node.invoke(state, config=config)
+
+    def _batch_has_write_tool(self, tool_calls: Sequence[dict[str, Any]]) -> bool:
+        """判断本批工具调用是否包含任何写工具"""
+        for call in tool_calls:
+            tool = self._tool_by_name.get(str(call.get("name", "")))
+            if (
+                tool is not None
+                and (tool.metadata or {}).get("effect") == "workspace_write"
+            ):
+                return True
+        return False
+
+    def _execute_write_batch_serially(
+        self,
+        tool_calls: Sequence[dict[str, Any]],
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        """按模型返回顺序串行执行整批工具调用并逐项回填 ToolMessage"""
+        results: list[ToolMessage] = []
+        for call in tool_calls:
+            name = str(call.get("name", "unknown"))
+            tool = self._tool_by_name.get(name)
+            if tool is None:
+                results.append(
+                    ToolMessage(
+                        content=_SAFE_TOOL_INPUT_MESSAGE,
+                        name=name,
+                        tool_call_id=str(call.get("id", "unknown")),
+                        status="error",
+                    )
+                )
+                continue
+            arguments = call.get("args")
+            results.append(
+                self._execute_with_boundary(
+                    name,
+                    str(call.get("id", "unknown")),
+                    lambda tool=tool, arguments=arguments: tool.invoke(
+                        dict(arguments or {}),
+                        config=config,
+                    ),
+                )
+            )
+        return {"messages": results}
 
     @staticmethod
     def _wrap_tool_call(request: Any, execute: Any) -> Any:
         """只转换明确的工具业务异常并保留原始调用关联"""
         call = request.tool_call
-        tool_name = str(call.get("name", "unknown"))
-        tool_call_id = str(call.get("id", "unknown"))
+        return Agent._execute_with_boundary(
+            str(call.get("name", "unknown")),
+            str(call.get("id", "unknown")),
+            lambda: execute(request),
+        )
+
+    @staticmethod
+    def _execute_with_boundary(
+        tool_name: str,
+        tool_call_id: str,
+        execute: Callable[[], Any],
+    ) -> Any:
+        """统一的工具执行边界：日志、耗时与唯一的错误转换"""
         started = time.perf_counter()
         try:
-            result = execute(request)
+            result = execute()
         except ToolException as error:
             logger.error(
                 "tool execution failed; tool=%s tool_call_id=%s duration_ms=%.1f "
@@ -411,6 +587,23 @@ class Agent:
             )
             return ToolMessage(
                 content=_handle_tool_error(error),
+                name=tool_name,
+                tool_call_id=tool_call_id,
+                status="error",
+            )
+        except ValidationError as error:
+            # 串行路径直接调用 tool.invoke，参数校验失败在此收敛为
+            # 工具错误结果（与 ToolNode 的 ToolInvocationError 语义一致）
+            logger.error(
+                "tool argument validation failed; tool=%s tool_call_id=%s "
+                "duration_ms=%.1f\n%s",
+                tool_name,
+                tool_call_id,
+                (time.perf_counter() - started) * 1000,
+                _format_safe_traceback(error),
+            )
+            return ToolMessage(
+                content=_SAFE_TOOL_INPUT_MESSAGE,
                 name=tool_name,
                 tool_call_id=tool_call_id,
                 status="error",
@@ -438,6 +631,66 @@ class Agent:
     def _increment_tool_rounds(self, state: AgentState) -> dict[str, int]:
         """将工具调用轮数增加一轮"""
         return {"tool_rounds": int(state["tool_rounds"]) + 1}
+
+    def _record_progress(self, state: AgentState) -> dict[str, Any]:
+        """把本轮工具调用写入进度账本并检测卡死
+
+        卡死判定：最近 ``max_stall_rounds`` 条记录的 ``stall_signature``
+        相同且没有最终回复。签名只由规范化后的工具名、参数摘要和结果摘要
+        组成，并行调用先排序再规范化；账本只保存摘要与哈希，不保存文件
+        内容或完整工具输出，且随一次 ``Agent.invoke`` 创建并丢弃。
+        """
+        messages = state["messages"]
+        last_ai: AIMessage | None = None
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                last_ai = message
+                break
+        record = ProgressRecord(
+            round_index=int(state["tool_rounds"]),
+            tool_names=(),
+            args_digest="",
+            results_digest="",
+            stall_signature="",
+        )
+        if last_ai is not None and last_ai.tool_calls:
+            results_by_id: dict[str, ToolMessage] = {}
+            for call_id in {str(call.get("id", "")) for call in last_ai.tool_calls}:
+                for message in reversed(messages):
+                    if (
+                        isinstance(message, ToolMessage)
+                        and str(message.tool_call_id) == call_id
+                    ):
+                        results_by_id[call_id] = message
+                        break
+            record = build_progress_record(
+                int(state["tool_rounds"]),
+                last_ai.tool_calls,
+                results_by_id,
+            )
+
+        progress_log = list(state.get("progress_log", []))
+        progress_log.append(record)
+        stalled = False
+        window = self._max_stall_rounds
+        if len(progress_log) >= window:
+            signatures = {entry.stall_signature for entry in progress_log[-window:]}
+            stalled = len(signatures) == 1 and record.stall_signature != ""
+        if stalled:
+            logger.warning(
+                "agent stall detected; round_index=%d signature=%s",
+                record.round_index,
+                record.stall_signature,
+            )
+        return {
+            "progress_log": progress_log,
+            "stalled": stalled,
+            "terminal_error": "agent_stall" if stalled else None,
+        }
+
+    def _route_after_record(self, state: AgentState) -> str:
+        """卡死时结束图，否则回到模型节点"""
+        return END if state.get("stalled") else "model"
 
     def _route_after_model(self, state: AgentState) -> str:
         """根据模型状态决定结束执行工具或闭合未执行调用"""

@@ -317,6 +317,14 @@ def test_safe_summary_excludes_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
         "temperature",
         "thinking_enabled",
         "reasoning_effort",
+        "summarizer_model_id",
+        "summarizer_base_url",
+        "context_target_tokens",
+        "context_hard_limit_tokens",
+        "keep_recent_turns",
+        "max_stall_rounds",
+        "knowledge_base_root",
+        "write_max_bytes",
         "api_key_configured",
     }
     assert api_key not in str(summary)

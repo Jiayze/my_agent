@@ -296,8 +296,8 @@ def test_build_conversation_wires_model_tools_agent_and_conversation() -> None:
         calls["model_config"] = received
         return model
 
-    def tools_factory() -> ToolRegistry:
-        calls["tools_called"] = True
+    def tools_factory(received: AgentConfig) -> ToolRegistry:
+        calls["workspace_root"] = received.workspace_root
         return registry
 
     def agent_factory(**kwargs: object) -> object:
@@ -308,9 +308,14 @@ def test_build_conversation_wires_model_tools_agent_and_conversation() -> None:
         calls["conversation"] = kwargs
         return conversation
 
+    def summarizer_factory(received: AgentConfig) -> object:
+        calls["summarizer_config"] = received
+        return object()
+
     result = main_module.build_conversation(
         config,
         model_factory=model_factory,  # type: ignore[arg-type]
+        summarizer_factory=summarizer_factory,  # type: ignore[arg-type]
         tools_factory=tools_factory,
         agent_factory=agent_factory,  # type: ignore[arg-type]
         conversation_factory=conversation_factory,  # type: ignore[arg-type]
@@ -318,17 +323,24 @@ def test_build_conversation_wires_model_tools_agent_and_conversation() -> None:
 
     assert result is conversation
     assert calls["model_config"] is config
-    assert calls["tools_called"] is True
+    assert calls["summarizer_config"] is config
+    assert calls["workspace_root"] == config.workspace_root
     assert calls["agent"] == {
         "model": model,
         "tools": registry,
         "max_tool_rounds": config.max_tool_rounds,
+        "max_stall_rounds": config.max_stall_rounds,
     }
-    assert calls["conversation"] == {
-        "conversation_id": "cli-default",
-        "agent": agent,
-        "system_prompt": SYSTEM_PROMPT,
+    assert set(calls["conversation"]) == {
+        "conversation_id",
+        "agent",
+        "system_prompt",
+        "context_compactor",
     }
+    assert calls["conversation"]["conversation_id"] == "cli-default"
+    assert calls["conversation"]["agent"] is agent
+    assert calls["conversation"]["system_prompt"] == SYSTEM_PROMPT
+    assert calls["conversation"]["context_compactor"] is not None
 
 
 def test_main_runs_injected_conversation_without_network(
