@@ -353,19 +353,37 @@ def test_agent_rejects_tool_without_effect_metadata() -> None:
     assert model.bound_tools == ()
 
 
-def test_agent_rejects_declared_side_effect_tool_without_policy() -> None:
+def test_agent_rejects_unknown_effect_vocabulary() -> None:
+    """V0.5 接受 read_only/workspace_write/host_command；其他词汇仍然拒绝"""
+
+    @tool
+    def danger_tool() -> str:
+        """测试声明未知 effect 的工具。"""
+        return "不应执行"
+
+    danger_tool.metadata = {"effect": "danger_full_access"}
+    model = FakeModel([])
+
+    with pytest.raises(ValueError, match="side-effect execution policy"):
+        Agent(model, [danger_tool], max_tool_rounds=1)
+
+    assert model.bound_tools == ()
+
+
+def test_agent_accepts_host_command_effect_vocabulary() -> None:
+    """host_command 是 V0.5 的合法 effect（执行策略由命令服务承担）"""
+
     @tool
     def host_command_tool() -> str:
         """测试声明为主机命令的工具。"""
         return "不应执行"
 
     host_command_tool.metadata = {"effect": "host_command"}
-    model = FakeModel([])
+    model = FakeModel([AIMessage(content="done")])
 
-    with pytest.raises(ValueError, match="side-effect execution policy"):
-        Agent(model, [host_command_tool], max_tool_rounds=1)
+    agent = Agent(model, [host_command_tool], max_tool_rounds=1)
 
-    assert model.bound_tools == ()
+    assert agent is not None
 
 
 def test_run_context_is_consumed_without_being_stored(

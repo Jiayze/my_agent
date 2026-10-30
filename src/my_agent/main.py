@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -23,7 +24,7 @@ from my_agent.conversation import Conversation
 from my_agent.llm import ModelInitializationError, create_chat_model
 from my_agent.logging_setup import HANDLER_MARKER, configure_logging
 from my_agent.models import AgentResult
-from my_agent.prompts import SYSTEM_PROMPT
+from my_agent.prompts import CODING_SYSTEM_PROMPT, SYSTEM_PROMPT
 from my_agent.tools import ToolRegistry, get_coding_tools, get_tools
 
 logger = logging.getLogger(__name__)
@@ -60,14 +61,26 @@ def _default_tools_factory(config: AgentConfig) -> ToolRegistry:
 def _coding_tools_factory(
     config: AgentConfig,
     state_dir: Path | None,
+    *,
+    input_fn: InputFn = input,
+    output_fn: OutputFn = print,
 ) -> ToolRegistry:
-    """coding profile 工具装配：只读工具 + 工作目录内写入（V0.4）"""
+    """coding profile 工具装配：只读工具 + 写入 + 可选命令执行（V0.4/V0.5）"""
+    from my_agent.approval import ApprovalService, HumanCliDecider
     from my_agent.side_effects.state_dir import default_state_root
 
+    # V0.5 人类决策者：本地交互式 CLI 的逐命令 y/N 审批
+    approval = ApprovalService(
+        [HumanCliDecider(input_fn, output_fn)],
+        mode=config.shell_approval,
+    )
     return get_coding_tools(
         config.workspace_root,
         state_dir=state_dir if state_dir is not None else default_state_root(),
         write_max_bytes=config.write_max_bytes,
+        approval_service=approval,
+        enable_shell=True,
+        shell_timeout_seconds=config.shell_timeout_seconds,
     )
 
 
@@ -87,6 +100,8 @@ def build_conversation(
     *,
     profile: str = "default",
     state_dir: Path | None = None,
+    input_fn: InputFn = input,
+    output_fn: OutputFn = print,
     model_factory: Callable[[AgentConfig], BaseChatModel] | None = None,
     summarizer_factory: Callable[[AgentConfig], BaseChatModel] | None = None,
     tools_factory: Callable[[AgentConfig], ToolRegistry] | None = None,
@@ -98,8 +113,8 @@ def build_conversation(
     默认工厂在函数体内解析，测试可以注入假模型和假装配函数而不访问网络。
     V0.2 起对话默认装配 token 压力感知的 ``SummarizingCompactor``，
     摘要模型缺省回落主模型，可以与主模型相同也可以不同。
-    ``profile="coding"`` 显式装配工作目录内写入能力（V0.4）；
-    默认 profile 不装配任何写入工具。
+    ``profile="coding"`` 显式装配工作目录内写入（V0.4）与命令执行（V0.5，
+    每条命令逐次人工批准）；默认 profile 不装配任何写入或命令工具。
     """
     if profile == "default":
         default_tools_factory: Callable[[AgentConfig], ToolRegistry] = (
@@ -108,7 +123,12 @@ def build_conversation(
     elif profile == "coding":
 
         def default_tools_factory(config: AgentConfig) -> ToolRegistry:
-            return _coding_tools_factory(config, state_dir)
+            return _coding_tools_factory(
+                config,
+                state_dir,
+                input_fn=input_fn,
+                output_fn=output_fn,
+            )
 
     else:
         raise ValueError(f"unknown profile: {profile!r}")
@@ -140,10 +160,11 @@ def build_conversation(
         hard_limit_tokens=config.context_hard_limit_tokens,
         keep_recent_turns=config.keep_recent_turns,
     )
+    system_prompt = CODING_SYSTEM_PROMPT if profile == "coding" else SYSTEM_PROMPT
     return conversation_factory(
         conversation_id=CONVERSATION_ID,
         agent=agent,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         context_compactor=compactor,
     )
 
@@ -203,14 +224,35 @@ def run_cli(
             output_fn(f"{_SAFE_TURN_ERROR_PREFIX}{result.reply}")
 
 
+def _parse_cli_profile(argv: Sequence[str] | None) -> str:
+    """解析 ``--profile`` 启动参数；默认 read-only profile
+
+    profile 是启动时由人显式选择的能力组合，不是模型或配置文件可以
+    临时打开的开关。
+    """
+    parser = argparse.ArgumentParser(prog="my-agent", add_help=False)
+    parser.add_argument(
+        "--profile",
+        choices=("default", "coding"),
+        default="default",
+        help="default: 只读工具; coding: 读/写文件 + 逐命令人工批准的命令执行",
+    )
+    known, _unknown = parser.parse_known_args(
+        list(argv) if argv is not None else None,
+    )
+    return known.profile
+
+
 def main(
     env_file: str | Path | None = DEFAULT_ENV_PATH,
     *,
+    argv: Sequence[str] | None = None,
     agent_factory: Callable[[], ChatConversation] | None = None,
     input_fn: InputFn = input,
     output_fn: OutputFn = print,
 ) -> int:
     """加载配置、装配对象并进入 CLI 循环后返回进程退出码"""
+    profile = _parse_cli_profile(argv)
     try:
         config = load_config(env_file=env_file)
     except ConfigurationError as exc:
@@ -231,7 +273,14 @@ def main(
 
     try:
         conversation = (
-            build_conversation(config) if agent_factory is None else agent_factory()
+            build_conversation(
+                config,
+                profile=profile,
+                input_fn=input_fn,
+                output_fn=output_fn,
+            )
+            if agent_factory is None
+            else agent_factory()
         )
     except ModelInitializationError as exc:
         logger.error(
@@ -241,7 +290,13 @@ def main(
         print(_SAFE_STARTUP_FAILURE, file=sys.stderr)
         return 1
 
-    output_fn(f"my-agent 已就绪（模型: {config.model_id}）。输入 /exit 或 /quit 退出。")
+    profile_notice = (
+        "" if profile == "default" else "（coding profile：命令执行需逐条批准）"
+    )
+    output_fn(
+        f"my-agent 已就绪（模型: {config.model_id}{profile_notice}）。"
+        "输入 /exit 或 /quit 退出。"
+    )
     return run_cli(conversation, input_fn=input_fn, output_fn=output_fn)
 
 

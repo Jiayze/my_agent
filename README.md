@@ -1,8 +1,9 @@
 # my_agent
 
 个人本地 Agent 框架（Windows / 单用户 / Python 3.10+）。
-当前版本推进到 **V0.4**：V0.1 离线核心与 CLI、V0.2 上下文压缩、
-V0.3 只读访问层与防卡死账本、V0.4 工作目录内写入（coding profile 显式装配）。
+当前版本推进到 **V0.5（可用的 CLI coding agent）**：V0.1 离线核心与 CLI、
+V0.2 上下文压缩、V0.3 只读访问层与防卡死账本、V0.4 工作目录内写入、
+V0.5 命令执行（每条命令逐次人工批准）。
 
 ## 当前能力
 
@@ -26,7 +27,21 @@ V0.3 只读访问层与防卡死账本、V0.4 工作目录内写入（coding pro
   持有按规范化路径划分的进程内写锁与 fencing token；覆盖前要求先读过且版本
   未变（`FS_STALE_VERSION`）；支持按快照确定性回滚；启动恢复丢弃未完成
   intent、清理孤儿快照、把遗留 `executing` 标记为结果未知并告警，绝不自动重试。
-- 同一模型响应只要包含写工具，整批按模型返回顺序串行执行；纯只读批次并行。
+- **V0.5 命令执行**（coding profile，`--profile coding` 显式启动）：
+  `run_command` 工具经 `cmd.exe /d /s /c` 执行命令；每条命令先在终端
+  逐次人工批准（[y/N]），删除文件、`git push/reset/revert/rebase/clean`、
+  修改系统配置等命令被策略**永久拒绝**（位于审批之上）；执行走
+  intent → 审批 → executing → 审计的完整记账，超时强制终止整棵进程树，
+  输出有界捕获并脱敏；结果状态区分 succeeded/failed/timed_out/denied/
+  unavailable/interrupted。
+- 审批按**决策者链**建模（决策 21）：当前只有人类 CLI 决策者；`never`
+  模式确定性拒绝；决策者异常或链尾无决定一律 fail closed。
+  **诚实声明：当前部署没有 OS 级沙盒**——命令以当前用户完整权限运行，
+  工作目录只是初始目录、不是安全边界；补偿控制是逐命令人工批准 +
+  禁止清单 + 有界输出 + 审计。受限 token / AppContainer 等 OS 后端 POC
+  仍是计划内 Shell 全面启用的前置条件。
+- 同一模型响应只要包含写工具或命令执行，整批按模型返回顺序串行执行；
+  纯只读批次并行。
 - 目录外写入一律拒绝并返回惰性建议文本；`.env`、密钥、`.git`、`.venv`、
   规则文件（`AGENTS.md` 等）永不可写；grant（目录外一次性授权）只交付
   数据模型，执行通道最早随 V0.5.1 开放。
@@ -36,7 +51,7 @@ V0.3 只读访问层与防卡死账本、V0.4 工作目录内写入（coding pro
 当前**不包含** Shell、目录外写入执行、TOTP/命令通道、QQ、RAG、多 Agent 或
 长期记忆；这些属于后续路线（V0.5+）。
 
-截至 2026-10-30，本阶段离线实现全部通过：**328 passed、4 skipped**，
+截至 2026-10-31，本阶段离线实现全部通过：**377 passed、4 skipped**，
 Ruff lint/format 通过。真实 DeepSeek API 的工具闭环及 reasoning 回传仍为
 **LIVE_UNVERIFIED**；离线 `MockTransport` 契约测试不代表真实服务已经验收。
 
@@ -71,6 +86,8 @@ python -m venv .venv
 | `KNOWLEDGE_BASE_ROOT` | 否 | 知识库目录（只读，必须与工作目录分离）；未配置时不注册检索工具 |
 | `WORKSPACE_ROOT` | 否 | 工作目录；缺省为项目根目录 |
 | `WRITE_MAX_BYTES` | 否 | V0.4 单次写入内容字节上限，默认 1 MiB |
+| `SHELL_APPROVAL` | 否 | V0.5 命令审批两态：`ask`（逐条询问）/ `never`（确定性拒绝），默认 `ask` |
+| `SHELL_TIMEOUT_SECONDS` | 否 | 命令默认超时（也是单次请求的上限），范围 5–600，默认 `120` |
 | `LOG_LEVEL` | 否 | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`，默认 `INFO` |
 
 ## DeepSeek 思考模式
@@ -109,8 +126,15 @@ python -m venv .venv
 - 输入阶段按 `Ctrl+C` 或 `Ctrl+Z`（EOF）。
 - 其他以 `/` 开头的文本按普通消息交给 Agent。
 
-CLI 使用默认（read-only）profile；写入能力只在显式的 coding profile 装配，
-见 `my_agent.main.build_conversation(profile="coding")`。
+启动 coding profile（读写文件 + 逐条批准的命令执行）：
+
+```powershell
+.\.venv\Scripts\python.exe -m my_agent --profile coding
+```
+
+CLI 默认使用 read-only profile；写入与命令能力只在显式的 coding profile 装配，
+见 `my_agent.main.build_conversation(profile="coding")`。命令执行过程中，
+每条命令都会先在终端打印命令全文并等待 `批准执行? [y/N]`。
 
 ## 演示工具
 
@@ -168,7 +192,11 @@ src/my_agent/
 ├── config.py            # 配置加载与校验（V0.2/V0.3/V0.4 字段）
 ├── llm.py               # 聊天模型工厂
 ├── deepseek_chat.py     # DeepSeek 思考模式 reasoning_content 兼容层
-├── agent.py             # 无状态 LangGraph Agent + 进度账本防卡死 + 串行写批次
+├── agent.py             # 无状态 LangGraph Agent + 进度账本防卡死 + 副作用批次串行
+├── bounded_process.py   # 共享有界子进程执行（超时终止进程树/输出上限）
+├── exec_policy.py       # V0.5 命令分类（allow/prompt/forbidden）
+├── approval.py          # V0.5 审批决策者链（人类 CLI 决策者）
+├── command_exec.py      # V0.5 CommandExecutionService（intent+审批+审计）
 ├── conversation.py      # 短期记忆与消息协议校验
 ├── compaction.py        # V0.2 上下文压缩（剪枝 → 摘要 → 硬截断）
 ├── logging_setup.py     # 日志配置与密钥脱敏
@@ -189,6 +217,6 @@ src/my_agent/
 
 ## 后续路线
 
-V0.5 用户命令通道与 TOTP → V0.5.1 Shell 沙盒、审批与一次性目录外 grant →
-V0.5.5 SSH 备用通道 → V0.6 QQ 与 ConversationStore → V0.7 桌面 →
-V0.8 长期记忆。详见 `agent_plan.md`。
+V0.5 用户命令通道与 TOTP（`/command`）→ V0.5.1 OS 沙盒 POC、一次性目录外
+grant 与 pending/resume → V0.5.5 SSH 备用通道 → V0.6 QQ 与 ConversationStore →
+V0.7 桌面 → V0.8 长期记忆。详见 `agent_plan.md`。

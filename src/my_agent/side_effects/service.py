@@ -561,8 +561,10 @@ class SideEffectService:
 
         pending = self.store.list_intents_by_status("prepared", "snapshot_ready")
         for intent in pending:
-            self.snapshots.delete_file(intent.snapshot_id)
-            self.store.delete_snapshot(intent.snapshot_id)
+            # host_command 类 intent 没有快照（snapshot_id 为空），只丢弃记录
+            if intent.snapshot_id:
+                self.snapshots.delete_file(intent.snapshot_id)
+                self.store.delete_snapshot(intent.snapshot_id)
             self.store.discard_intent(intent.request_id)
             discarded.append(intent.request_id)
 

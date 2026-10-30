@@ -93,8 +93,15 @@ def _handle_tool_error(error: ToolException) -> str:
     return _SAFE_TOOL_EXECUTION_FAILED_MESSAGE
 
 
+SIDE_EFFECT_EFFECTS = frozenset({"workspace_write", "host_command"})
+"""需要副作用感知调度（串行批次）的 effect 集合"""
+
+ACCEPTED_EFFECTS = frozenset({"read_only"}) | SIDE_EFFECT_EFFECTS
+"""Agent 核心接受的全部 effect 词汇（V0.5：只读 / 工作目录内写入 / 命令执行）"""
+
+
 def _require_tool_effects(tools: Sequence[BaseTool]) -> None:
-    """每个工具必须声明显式 effect；V0.4 接受只读与工作目录内写入"""
+    """每个工具必须声明显式 effect；V0.5 接受只读/写入/命令执行"""
     for tool in tools:
         metadata = tool.metadata or {}
         if "effect" not in metadata:
@@ -102,7 +109,7 @@ def _require_tool_effects(tools: Sequence[BaseTool]) -> None:
                 f"tool {tool.name!r} must declare an explicit 'effect' metadata"
             )
         effect = metadata["effect"]
-        if effect not in ("read_only", "workspace_write"):
+        if effect not in ACCEPTED_EFFECTS:
             raise ValueError(
                 f"tool {tool.name!r} requires a side-effect execution policy; "
                 f"got effect: {effect!r}"
@@ -512,12 +519,12 @@ class Agent:
         return self._tools_node.invoke(state, config=config)
 
     def _batch_has_write_tool(self, tool_calls: Sequence[dict[str, Any]]) -> bool:
-        """判断本批工具调用是否包含任何写工具"""
+        """判断本批工具调用是否包含任何副作用工具（写入或命令执行）"""
         for call in tool_calls:
             tool = self._tool_by_name.get(str(call.get("name", "")))
             if (
                 tool is not None
-                and (tool.metadata or {}).get("effect") == "workspace_write"
+                and (tool.metadata or {}).get("effect") in SIDE_EFFECT_EFFECTS
             ):
                 return True
         return False
@@ -626,7 +633,17 @@ class Agent:
             tool_call_id,
             (time.perf_counter() - started) * 1000,
         )
-        return result
+        if isinstance(result, ToolMessage):
+            return result
+        # 串行路径的 tool.invoke 返回裸内容；必须包成 ToolMessage，
+        # 否则 add_messages 会把裸字符串当作 HumanMessage 提交，
+        # 破坏 "每个 tool_call_id 恰好一个 ToolMessage" 的协议不变量
+        content = result if isinstance(result, str) else str(result)
+        return ToolMessage(
+            content=content,
+            name=tool_name,
+            tool_call_id=tool_call_id,
+        )
 
     def _increment_tool_rounds(self, state: AgentState) -> dict[str, int]:
         """将工具调用轮数增加一轮"""

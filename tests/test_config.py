@@ -325,6 +325,8 @@ def test_safe_summary_excludes_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
         "max_stall_rounds",
         "knowledge_base_root",
         "write_max_bytes",
+        "shell_approval",
+        "shell_timeout_seconds",
         "api_key_configured",
     }
     assert api_key not in str(summary)

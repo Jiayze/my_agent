@@ -37,6 +37,9 @@ def get_coding_tools(
     *,
     state_dir: Path | str,
     write_max_bytes: int = DEFAULT_WRITE_MAX_BYTES,
+    approval_service: object | None = None,
+    enable_shell: bool = False,
+    shell_timeout_seconds: int = 120,
 ) -> ToolRegistry:
     """返回 coding profile 的工具注册表（显式装配，默认 Agent 不使用）
 
@@ -44,6 +47,10 @@ def get_coding_tools(
     提供 intent/快照/回滚与版本守卫。读取账本回调把 read_text_file 的
     读取记录到服务中，作为"先读后写"的依据。``state_dir`` 必须位于
     应用状态目录内，不注册为任何 Agent 工具的根目录。
+
+    Shell 工具（V0.5）只在 ``enable_shell=True`` 且提供了
+    ``approval_service``（ApprovalService）时装配；两者缺一即不注册，
+    不能由配置布尔值或模型消息临时打开。
     """
     # 延迟导入避免 tools <-> side_effects 的包级循环
     from my_agent.side_effects.service import ReadFingerprint, SideEffectService
@@ -67,13 +74,31 @@ def get_coding_tools(
             ReadFingerprint(size=size, mtime_ns=mtime_ns),
         )
 
-    return ToolRegistry(
-        [
-            add_numbers,
-            *build_repo_read_tools(workspace_root, on_read=record_read),
-            *build_repo_write_tools(service),
-        ]
-    )
+    tools: list[object] = [
+        add_numbers,
+        *build_repo_read_tools(workspace_root, on_read=record_read),
+        *build_repo_write_tools(service),
+    ]
+
+    if enable_shell:
+        if approval_service is None:
+            raise ValueError(
+                "enable_shell requires an ApprovalService; refusing to "
+                "assemble a shell tool without an approval channel"
+            )
+        # 延迟导入保持默认装配路径不触碰命令执行模块
+        from my_agent.command_exec import CommandExecutionService
+        from my_agent.tools.shell_tool import build_shell_tool
+
+        command_service = CommandExecutionService(
+            workspace_root,
+            state_dir,
+            approval=approval_service,
+            default_timeout_seconds=shell_timeout_seconds,
+        )
+        tools.extend(build_shell_tool(command_service))
+
+    return ToolRegistry(tools)
 
 
 __all__ = [

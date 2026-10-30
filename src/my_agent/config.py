@@ -44,6 +44,12 @@ DEFAULT_MAX_STALL_ROUNDS = 3
 DEFAULT_WRITE_MAX_BYTES = 1024 * 1024
 """V0.4 单次写入内容的字节上限"""
 
+DEFAULT_SHELL_TIMEOUT_SECONDS = 120
+"""V0.5 命令执行默认超时（也是 timeout_seconds 参数的上限）"""
+
+VALID_SHELL_APPROVALS = ("ask", "never")
+"""审批配置只有两态：ask（交给决策者链）与 never（确定性拒绝）"""
+
 _THINKING_VALUES = {"enabled": True, "disabled": False}
 
 UNPRINTABLE_URL = "<redacted-url>"
@@ -321,6 +327,8 @@ class AgentConfig:
     max_stall_rounds: int = DEFAULT_MAX_STALL_ROUNDS
     knowledge_base_root: Path | None = None
     write_max_bytes: int = DEFAULT_WRITE_MAX_BYTES
+    shell_approval: str = "ask"
+    shell_timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         """校验并规范化所有配置字段"""
@@ -459,6 +467,21 @@ class AgentConfig:
                 maximum=16 * 1024 * 1024,
             ),
         )
+        if self.shell_approval not in VALID_SHELL_APPROVALS:
+            raise ConfigurationError(
+                "shell_approval",
+                f"must be one of: {', '.join(VALID_SHELL_APPROVALS)}",
+            )
+        object.__setattr__(
+            self,
+            "shell_timeout_seconds",
+            _require_integer(
+                "shell_timeout_seconds",
+                self.shell_timeout_seconds,
+                minimum=5,
+                maximum=600,
+            ),
+        )
 
     def safe_summary(self) -> dict[str, object]:
         """返回不含 API key 和 URL 凭据的启动诊断摘要
@@ -488,6 +511,8 @@ class AgentConfig:
                 else None
             ),
             "write_max_bytes": self.write_max_bytes,
+            "shell_approval": self.shell_approval,
+            "shell_timeout_seconds": self.shell_timeout_seconds,
             "api_key_configured": True,
         }
 
@@ -637,6 +662,17 @@ def _parse_knowledge_base_root(
     return Path(raw_value)
 
 
+def _parse_shell_approval(environment: Mapping[str, str | None]) -> str:
+    """读取命令审批两态配置；默认 ask（交给决策者链）"""
+    raw_value = _read_optional(environment, "SHELL_APPROVAL", "ask").lower()
+    if raw_value not in VALID_SHELL_APPROVALS:
+        raise ConfigurationError(
+            "SHELL_APPROVAL",
+            f"must be one of: {', '.join(VALID_SHELL_APPROVALS)}, got: {raw_value!r}",
+        )
+    return raw_value
+
+
 def load_config(
     env_file: str | Path | None = DEFAULT_ENV_PATH,
     *,
@@ -729,6 +765,14 @@ def load_config(
                 minimum=1,
                 maximum=16 * 1024 * 1024,
             ),
+            shell_approval=_parse_shell_approval(merged),
+            shell_timeout_seconds=_parse_integer(
+                merged,
+                "SHELL_TIMEOUT_SECONDS",
+                str(DEFAULT_SHELL_TIMEOUT_SECONDS),
+                minimum=5,
+                maximum=600,
+            ),
         )
     except ConfigurationError as error:
         field_names = {
@@ -751,6 +795,8 @@ def load_config(
             "max_stall_rounds": "MAX_STALL_ROUNDS",
             "knowledge_base_root": "KNOWLEDGE_BASE_ROOT",
             "write_max_bytes": "WRITE_MAX_BYTES",
+            "shell_approval": "SHELL_APPROVAL",
+            "shell_timeout_seconds": "SHELL_TIMEOUT_SECONDS",
         }
         public_field = field_names.get(error.field, error.field)
         if public_field == error.field:

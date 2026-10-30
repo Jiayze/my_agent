@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS grants (
     expires_at TEXT NOT NULL,
     used_at TEXT
 );
+CREATE TABLE IF NOT EXISTS shell_audits (
+    request_id TEXT PRIMARY KEY,
+    command TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    decided_by TEXT NOT NULL,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    timed_out INTEGER NOT NULL DEFAULT 0,
+    duration_ms REAL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -223,6 +234,70 @@ class IntentStore:
         if from_status not in ("done", "failed", "unknown"):
             return False
         return self._transition(request_id, from_status, "rolled_back")
+
+    def mark_rejected(self, request_id: str) -> bool:
+        """prepared → rejected（策略拒绝或审批未通过，从未执行）"""
+        return self._transition(request_id, "prepared", "rejected")
+
+    def mark_command_executing(self, request_id: str) -> bool:
+        """prepared → executing（host_command 专用：无快照阶段）
+
+        写文件的 snapshot_ready 阶段对命令不存在；审批通过即进入 executing。
+        """
+        return self._transition(request_id, "prepared", "executing")
+
+    # ---------- shell 审计 ----------
+
+    def record_shell_audit(
+        self,
+        request_id: str,
+        *,
+        command: str,
+        decision: str,
+        decided_by: str,
+        status: str,
+        exit_code: int | None = None,
+        timed_out: bool = False,
+        duration_ms: float | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """写入一条命令执行审计记录（策略/审批/结果终态各写一次）"""
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO shell_audits VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    request_id,
+                    command,
+                    decision,
+                    decided_by,
+                    status,
+                    exit_code,
+                    1 if timed_out else 0,
+                    duration_ms,
+                    created_at or utc_now_iso(),
+                ),
+            )
+
+    def list_shell_audits(self) -> list[dict[str, object]]:
+        """返回全部命令审计记录（按写入顺序）"""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT request_id, command, decision, decided_by, status, "
+                "exit_code, timed_out, duration_ms, created_at FROM shell_audits"
+            ).fetchall()
+        keys = (
+            "request_id",
+            "command",
+            "decision",
+            "decided_by",
+            "status",
+            "exit_code",
+            "timed_out",
+            "duration_ms",
+            "created_at",
+        )
+        return [dict(zip(keys, row, strict=True)) for row in rows]
 
     def discard_intent(self, request_id: str) -> None:
         """删除尚未进入 executing 的 intent（安全丢弃）"""
