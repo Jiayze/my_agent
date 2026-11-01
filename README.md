@@ -28,10 +28,13 @@ V0.5 命令执行（每条命令逐次人工批准）。
   未变（`FS_STALE_VERSION`）；支持按快照确定性回滚；启动恢复丢弃未完成
   intent、清理孤儿快照、把遗留 `executing` 标记为结果未知并告警，绝不自动重试。
 - **V0.5 命令执行**（coding profile，`--profile coding` 显式启动）：
-  `run_command` 工具经 `cmd.exe /d /s /c` 执行命令；每条命令先在终端
-  逐次人工批准（[y/N]），删除文件、`git push/reset/revert/rebase/clean`、
-  修改系统配置等命令被策略**永久拒绝**（位于审批之上）；执行走
-  intent → 审批 → executing → 审计的完整记账，超时强制终止整棵进程树，
+  `run_command` 工具经 `cmd.exe /d /s /c` 执行命令（命令行按 cmd 原生
+  引号语义原样传递）；每条命令先在终端逐次人工批准（[y/N]），删除文件、
+  `git push/reset/revert/rebase/clean`、修改系统配置等**常见形态**被策略
+  拒绝（位于审批之上；字符串检测尽力而为，变形或脚本代码只会落入人工
+  审批——人工审批是最终边界）；执行走
+  intent → 审批 → executing → 审计的完整记账；命令等待**整棵进程树**
+  到达终态才返回（Job Object 接管后代进程），超时强制终止整树；
   输出有界捕获并脱敏；结果状态区分 succeeded/failed/timed_out/denied/
   unavailable/interrupted。
 - 审批按**决策者链**建模（决策 21）：当前只有人类 CLI 决策者；`never`

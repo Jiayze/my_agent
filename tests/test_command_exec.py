@@ -1,10 +1,13 @@
 """V0.5 CommandExecutionService 测试：真实 cmd.exe、离线、无网络。
 
 覆盖结果状态协议（succeeded/failed/timed_out/denied/unavailable）、
-intent 生命周期、审计记录与超时进程树终止。
+intent 生命周期、审计记录、超时进程树终止、cmd 原生引号语义与
+整棵进程树生命周期。
 """
 
 import json
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -235,3 +238,119 @@ def test_shell_tool_json_contract(workspace: Path, state_dir: Path) -> None:
 
     assert payload["status"] == "succeeded"
     assert "tool-round-trip" in payload["stdout"]
+
+
+# ---------- 返工 P1-1：cmd 原生引号语义（2026-11-01） ----------
+# 修复前：argv 经 list2cmdline 二次转义，引号变成字面 \" 或被吞掉，
+# 出现报错甚至 "succeeded 但语义完全不同" 的假成功。
+
+
+def test_quoted_executable_path_runs(workspace: Path, state_dir: Path) -> None:
+    service = _service(workspace, state_dir, FakeDecider())
+
+    outcome = service.run(f'"{sys.executable}" --version')
+
+    assert outcome.status == "succeeded", outcome.stderr
+    assert outcome.exit_code == 0
+    assert "Python" in outcome.stdout
+
+
+def test_python_dash_c_prints_output(workspace: Path, state_dir: Path) -> None:
+    """修复前：succeeded、退出 0 但无输出（假成功）"""
+    service = _service(workspace, state_dir, FakeDecider())
+
+    outcome = service.run(f'{sys.executable} -c "print(12345)"')
+
+    assert outcome.status == "succeeded", outcome.stderr
+    assert "12345" in outcome.stdout
+
+
+def test_python_dash_c_exit_code_is_preserved(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    """修复前：内部引号被改写，退出码 7 变成语法错误退出 1"""
+    service = _service(workspace, state_dir, FakeDecider())
+
+    outcome = service.run(f'{sys.executable} -c "import sys; sys.exit(7)"')
+
+    assert outcome.status == "failed"
+    assert outcome.exit_code == 7
+
+
+def test_quoted_path_with_spaces(workspace: Path, state_dir: Path) -> None:
+    space_dir = state_dir.parent / "py dir"
+    space_dir.mkdir(exist_ok=True)
+    script = space_dir / "probe script.cmd"
+    script.write_text("@echo space-path-ok", encoding="utf-8")
+    service = _service(workspace, state_dir, FakeDecider())
+
+    outcome = service.run(f'"{script}"')
+
+    assert outcome.status == "succeeded", outcome.stderr
+    assert "space-path-ok" in outcome.stdout
+
+
+def test_multi_arguments_with_spaces(workspace: Path, state_dir: Path) -> None:
+    service = _service(workspace, state_dir, FakeDecider())
+
+    outcome = service.run(
+        f'{sys.executable} -c "import sys; print(sys.argv[1])" "hello world"'
+    )
+
+    assert outcome.status == "succeeded", outcome.stderr
+    assert "hello world" in outcome.stdout
+
+
+def test_redirection_and_compound_commands(workspace: Path, state_dir: Path) -> None:
+    service = _service(workspace, state_dir, FakeDecider())
+
+    redirect = service.run("echo redirect-ok> out.txt")
+    compound = service.run("echo part-a & echo part-b")
+
+    assert redirect.status == "succeeded"
+    assert (workspace / "out.txt").read_text(encoding="utf-8").strip() == "redirect-ok"
+    assert compound.status == "succeeded"
+    assert "part-a" in compound.stdout and "part-b" in compound.stdout
+
+
+# ---------- 返工 P1-2：整棵进程树的生命周期（2026-11-01） ----------
+# 修复前：根进程退出即返回 succeeded，分离的后代进程仍能继续写文件。
+
+
+def test_returns_only_after_whole_tree_exits(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    """分离孙进程（stdio 全部脱离管道）写入标记：返回时必须已完成"""
+    service = _service(workspace, state_dir, FakeDecider())
+    marker = workspace / "grandchild_marker.txt"
+    assert not marker.exists()
+
+    outcome = service.run(
+        'start "" /b cmd /c "ping -n 3 127.0.0.1 >nul 2>&1 '
+        '& echo done>grandchild_marker.txt"'
+    )
+
+    assert outcome.status == "succeeded", outcome.stderr
+    # 服务返回即承诺整棵树已到终态：标记必须已写入
+    assert marker.exists()
+
+
+def test_timeout_kills_detached_grandchild(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    service = _service(workspace, state_dir, FakeDecider())
+    marker = workspace / "late_marker.txt"
+
+    outcome = service.run(
+        'start "" /b cmd /c "ping -n 60 127.0.0.1 >nul 2>&1 '
+        '& echo done>late_marker.txt"',
+        timeout_seconds=5,
+    )
+
+    assert outcome.status == "timed_out"
+    time.sleep(2)
+    # 整树已被终止：延迟写入永远不会发生
+    assert not marker.exists()

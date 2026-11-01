@@ -100,6 +100,63 @@ def test_case_and_token_boundaries() -> None:
     assert evaluate_command('cmd /c "del note.txt"').decision == "forbidden"
 
 
+def test_caret_escaped_deletion_is_caught() -> None:
+    """返工 P2：cmd 的 ^ 转义变形必须被归一化识别"""
+    for command in (
+        "cmd /c d^el harmless.txt",
+        "d^el harmless.txt",
+        "r^d /s /q build",
+        "CMD /C D^EL harmless.txt",
+    ):
+        decision = evaluate_command(command)
+        assert decision.decision == "forbidden", command
+
+
+def test_arguments_with_forbidden_words_are_not_forbidden() -> None:
+    """返工 P2：参数/子命令位置的同名 token 不应被误杀"""
+    for command in (
+        "python -m ruff format .",
+        "npm run clean",
+        "echo clean",
+        "echo format",
+        "pip cache clean --force",
+        'python -c "print(format)"',
+    ):
+        decision = evaluate_command(command)
+        assert decision.decision == "prompt", command
+
+
+def test_forbidden_still_caught_in_command_position() -> None:
+    """命令位置（裸命令或 cmd /c 等包装器之后）的禁词保持拒绝"""
+    for command in (
+        "format e:",
+        "cmd /c format e:",
+        "clean .",
+        "start format e:",
+        "cmd /c rd /s /q build",
+    ):
+        decision = evaluate_command(command)
+        assert decision.decision == "forbidden", command
+
+
+def test_script_code_forms_land_on_human_approval() -> None:
+    """已知残余：脚本代码无法被字符串分类穷尽，落入人工审批"""
+    for command in (
+        "python -c \"import os; os.remove('harmless.txt')\"",
+        'powershell -Command "Get-Content x"',
+    ):
+        decision = evaluate_command(command)
+        assert decision.decision == "prompt", command
+
+
+def test_policy_decision_reasons_do_not_overpromise() -> None:
+    """返工 P2：对外措辞不得宣称'永久禁止'"""
+    decision = evaluate_command("del note.txt")
+
+    assert "永久" not in decision.reason
+    assert "人工审批" in decision.reason
+
+
 def test_oversized_command_degrades_to_prompt() -> None:
     decision = evaluate_command("echo " + "x" * (MAX_COMMAND_CHARS + 10))
 

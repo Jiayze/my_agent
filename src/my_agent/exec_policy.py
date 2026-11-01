@@ -6,11 +6,14 @@
   ``forbidden`` 位于审批和一次性 grant 之上，任何授权都不能绕过。
 - 三档对应：只读操作 ``allow``；测试、安装、启动、普通写入 ``prompt``；
   删除、push、Git 历史改写等 ``forbidden``。
-- ``forbidden`` 的判定手段只是尽力而为的纵深防线：字符串/前缀匹配必然
-  能被变形绕过，真正的边界是 OS 后端；无法可靠解析的复合命令一律降级为
-  ``prompt``，绝不默认 ``allow``。
-- 当前部署的 allow 集合为空：每一条命令要么需要逐次人工批准（prompt），
-  要么被直接拒绝（forbidden）。
+- **forbidden 的判定手段只是尽力而为的纵深防线**（返工 2026-11-01 措辞
+  收敛）：字符串匹配**不能保证**操作类别被永久禁止——脱字符归一化能覆盖
+  ``d^el`` 这类变形，但变量展开、脚本代码（``python -c "os.remove(...)"``）、
+  解释器内嵌等形态无法被字符串分类穷尽。禁止清单的作用是把明显形态挡在
+  审批之前；**每条命令的逐次人工审批才是最终边界**，不能把它当作 OS 隔离
+  的替代证据。
+- 无法可靠解析的复合命令一律降级为 ``prompt``，绝不默认 ``allow``；
+  当前部署的 allow 集合为空。
 """
 
 from __future__ import annotations
@@ -24,9 +27,12 @@ MAX_COMMAND_CHARS = 8192
 _COMPOUND_SPLIT = re.compile(r"&&|\|\||&|\||;|\n|\r")
 
 # 逐 token 切分：空白与常见 shell 元字符都视为边界
-_TOKEN_SPLIT = re.compile(r"[\s<>()^\"']+")
+_TOKEN_SPLIT = re.compile(r"[\s<>()^\"',]+")
 
-# 禁止类别的裸命令名/模式（大小写不敏感，逐词匹配）
+# 危险词按"命令位置"匹配：裸命令、或紧跟 shell 包装器（cmd /c 等）之后。
+# 这避免把参数中的同名子命令误杀（``ruff format``、``npm run clean``、
+# ``echo clean``），同时仍覆盖 ``cmd /c format`` 这类嵌套形态。
+# 被 & ; | 等分隔符切开的段首天然处于命令位置。
 _FORBIDDEN_WORDS: frozenset[str] = frozenset(
     {
         # 文件/目录删除（cmd 与 PowerShell 两种词形）
@@ -37,7 +43,7 @@ _FORBIDDEN_WORDS: frozenset[str] = frozenset(
         "rm",
         "remove-item",
         "ri",
-        # Git push / 历史改写 / 工作区清理
+        # Git push / 历史改写 / 工作区清理（git <sub> 另有专门扫描）
         "push",
         "reset",
         "revert",
@@ -78,6 +84,27 @@ _FORBIDDEN_WORDS: frozenset[str] = frozenset(
     }
 )
 
+# cmd 的脱字符（^）是转义前缀：``d^el`` 实际执行的就是 ``del``。
+# 匹配前把 ^ 全部移除，覆盖最常见的转义变形；更复杂的变形
+# （变量展开、脚本代码）依赖人工审批兜底。
+_CARET = "^"
+
+# 出现这些 token 后，下一个 token 仍处于"命令位置"
+_SHELL_WRAPPERS: frozenset[str] = frozenset(
+    {
+        "cmd",
+        "cmd.exe",
+        "start",
+        "call",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "/c",
+        "/k",
+    }
+)
+
 
 @dataclass(frozen=True)
 class PolicyDecision:
@@ -101,8 +128,12 @@ def _split_segments(command: str) -> list[str]:
 
 
 def _tokens(segment: str) -> list[str]:
-    """切分单个命令段为小写 token 序列"""
-    return [token for token in _TOKEN_SPLIT.split(segment.lower()) if token]
+    """切分单个命令段为小写 token 序列（脱字符归一化后）"""
+    normalized = segment.lower()
+    if _CARET in normalized:
+        # cmd 中 ^ 转义下一个字符：移除后即实际执行的词形
+        normalized = normalized.replace(_CARET, "")
+    return [token for token in _TOKEN_SPLIT.split(normalized) if token]
 
 
 def _git_forbidden_subcommands(tokens: list[str]) -> str | None:
@@ -138,12 +169,26 @@ def _git_forbidden_subcommands(tokens: list[str]) -> str | None:
     return None
 
 
+def _first_forbidden_token(tokens: list[str]) -> str | None:
+    """返回第一个处于命令位置的禁止词；不在命令位置的忽略
+
+    命令位置 = 段首，或紧跟 shell 包装器（cmd /c、start、powershell 等）
+    之后。参数位置的同名 token（``ruff format``、``echo clean``）不算。
+    """
+    command_position = True
+    for token in tokens:
+        if command_position and token in _FORBIDDEN_WORDS:
+            return token
+        command_position = token in _SHELL_WRAPPERS
+    return None
+
+
 def evaluate_command(command: str) -> PolicyDecision:
     """对一条命令行做策略分类
 
-    解析顺序：基础校验 → 逐段逐 token 扫描禁止词与 ``git`` 禁止子命令 →
-    默认 ``prompt``。allow 集合当前为空；任何无法解析的形态都落在
-    ``prompt``，由人工审批兜底，绝不自动放行。
+    解析顺序：基础校验 → 逐段（脱字符归一化）扫描禁止词与 ``git``
+    禁止子命令 → 默认 ``prompt``。allow 集合当前为空；任何无法解析的
+    形态都落在 ``prompt``，由人工审批兜底，绝不自动放行。
     """
     if not isinstance(command, str) or not command.strip():
         return PolicyDecision(
@@ -165,15 +210,16 @@ def evaluate_command(command: str) -> PolicyDecision:
             return PolicyDecision(
                 decision="forbidden",
                 category="git_history_or_remote",
-                reason=f"git {git_hit} 属于 push/历史改写/清理类，永久拒绝",
+                reason=f"git {git_hit} 属于 push/历史改写/清理类，被策略拒绝",
             )
-        for token in tokens:
-            if token in _FORBIDDEN_WORDS:
-                return PolicyDecision(
-                    decision="forbidden",
-                    category="forbidden_command",
-                    reason=f"{token} 属于删除/系统修改类，永久拒绝",
-                )
+        forbidden = _first_forbidden_token(tokens)
+        if forbidden is not None:
+            return PolicyDecision(
+                decision="forbidden",
+                category="forbidden_command",
+                reason=f"{forbidden} 属于删除/系统修改类常见形态，被策略拒绝"
+                "（字符串检测尽力而为，人工审批是最终边界）",
+            )
 
     return PolicyDecision(
         decision="prompt",

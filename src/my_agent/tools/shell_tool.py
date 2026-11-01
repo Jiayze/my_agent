@@ -31,12 +31,18 @@ def build_shell_tool(service: CommandExecutionService) -> tuple[BaseTool, ...]:
         """在用户批准后，于工作目录内执行一条 Windows 命令行（cmd.exe）。
 
         每一条命令都会先由用户在终端逐次批准（[y/N]），未经批准绝不执行；
-        删除文件、git push/reset/revert/rebase/clean、修改系统配置等命令
-        被策略永久拒绝，不要尝试或变通。命令在工作目录中以当前用户完整
-        权限运行（无 OS 沙盒；工作目录只是初始目录，不是安全边界），输出
-        有界捕获并脱敏，超时会被强制终止整棵进程树。timeout_seconds 仅在
-        部署配置允许的范围内生效。结果包含 status（succeeded/failed/
-        timed_out/denied/unavailable）、exit_code 与脱敏后的 stdout/stderr。
+        批准提示会展示命令全文，人工审批是最终边界。删除文件、
+        git push/reset/revert/rebase/clean、修改系统配置等**常见形态**
+        会被策略直接拒绝，但该检测是尽力而为的字符串匹配：转义变形
+        （如 d^el）已覆盖，而变量展开、脚本代码（如 python -c
+        "os.remove(...)"）、解释器内嵌等形态无法被分类穷尽，只会落入
+        人工审批——不要尝试任何删除、push 或系统修改，也不要变通绕过。
+        命令在工作目录中以当前用户完整权限运行（无 OS 沙盒；工作目录
+        只是初始目录，不是安全边界）。命令会等待**整棵进程树**结束后才
+        返回（含分离的后代进程）；后台常驻进程会被视为超时并整树终止。
+        输出有界捕获并脱敏。timeout_seconds 仅在部署配置允许的范围内
+        生效。结果包含 status（succeeded/failed/timed_out/denied/
+        unavailable）、exit_code 与脱敏后的 stdout/stderr。
         命令不可重试：已启动但结果未知时再次执行等于第二次真实副作用。
         """
         outcome = service.run(command, timeout_seconds)

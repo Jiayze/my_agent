@@ -221,10 +221,14 @@ class CommandExecutionService:
             )
 
         started = time.perf_counter()
-        argv = [str(self._interpreter), "/d", "/s", "/c", command]
+        # cmd /s /c 的原生引号语义：shell 文本作为单条命令行**原样**交给
+        # CreateProcess。绝不能走 argv 列表——list2cmdline 的 C 运行时转义
+        # 会把 shell 文本中的引号改写成 \"（报错）或吞掉（假成功）；
+        # /s 让 cmd 剥掉最外层引号并原样保留内部引号。
+        command_line = f'"{self._interpreter}" /d /s /c "{command}"'
         try:
             process_result = run_bounded(
-                argv,
+                command_line,
                 cwd=self.workspace_root,
                 timeout_seconds=effective_timeout,
                 env=child_environment(),

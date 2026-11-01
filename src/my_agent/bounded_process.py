@@ -3,10 +3,25 @@
 所有需要启动子进程的组件（只读 rg/git 工具与命令执行服务）共用本模块：
 运行中就有界的输出捕获、超时/超限即终止整棵进程树、固定 taskkill 路径、
 最小化子进程环境。调用方拿不到原始进程对象，只拿结构化结果。
+
+Windows 进程树契约（返工 2026-11-01）：
+
+- ``args`` 传**列表**时按 C 运行时规则序列化（rg/git 等固定参数场景）；
+  传**字符串**时原样作为 ``lpCommandLine`` 交给 CreateProcess——供
+  ``cmd /d /s /c`` 使用，避免一份 shell 文本被两套转义规则改写。
+- 子进程以 ``CREATE_SUSPENDED`` 创建，先挂入 **Kill-on-close Job Object**
+  再恢复执行：全部后代默认继承进入 Job，无 breakaway 通道。
+- 完成条件是**根进程、输出读取线程与整个 Job 的活动进程数**三者全部
+  到达终态；只等根 PID 不再被视为完成。
+- 超时/输出超限/Ctrl+C：先 ``TerminateJobObject`` 再 taskkill 兜底，
+  并等待整棵树退出后才返回。
+- 本进程意外崩溃时，Job 句柄由操作系统关闭，Kill-on-close 兑现
+  "树随之终止"，不留孤儿副作用进程。
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import threading
@@ -21,6 +36,8 @@ MAX_SUBPROCESS_OUTPUT_BYTES = 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _KILL_TIMEOUT_SECONDS = 5
 _DRAIN_JOIN_SECONDS = 2
+
+_TREE_DRAIN_POLL_SECONDS = 0.02
 
 
 def child_environment() -> dict[str, str]:
@@ -72,6 +89,219 @@ def terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         process.kill()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Windows Job Object：整棵进程树的生命周期接管
+# ---------------------------------------------------------------------------
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JobObjectExtendedLimitInformation = 9
+_JobObjectBasicAccountingInformation = 1
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_int64),
+        ("TotalKernelTime", ctypes.c_int64),
+        ("ThisPeriodTotalUserTime", ctypes.c_int64),
+        ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+        ("TotalPageFaultCount", ctypes.c_uint32),
+        ("TotalProcesses", ctypes.c_uint32),
+        ("ActiveProcesses", ctypes.c_uint32),
+        ("TotalTerminatedProcesses", ctypes.c_uint32),
+    ]
+
+
+class _THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ThreadID", ctypes.c_uint32),
+        ("th32OwnerProcessID", ctypes.c_uint32),
+        ("tpBasePri", ctypes.c_int32),
+        ("tpDeltaPri", ctypes.c_int32),
+        ("dwFlags", ctypes.c_uint32),
+    ]
+
+
+def _kernel32() -> ctypes.WinDLL:
+    library = ctypes.WinDLL("kernel32", use_last_error=True)
+    library.CreateJobObjectW.restype = ctypes.c_void_p
+    library.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    library.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    library.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    library.AssignProcessToJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    library.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    library.CloseHandle.argtypes = [ctypes.c_void_p]
+    library.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    library.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    library.Thread32First.argtypes = [ctypes.c_void_p, ctypes.POINTER(_THREADENTRY32)]
+    library.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(_THREADENTRY32)]
+    library.OpenThread.restype = ctypes.c_void_p
+    library.OpenThread.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint32,
+    ]
+    library.ResumeThread.argtypes = [ctypes.c_void_p]
+    return library
+
+
+def _create_kill_on_close_job() -> int | None:
+    """创建 Kill-on-close 的 Job 对象；失败返回 None（调用方降级）"""
+    library = _kernel32()
+    job = library.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not library.SetInformationJobObject(
+        job,
+        _JobObjectExtendedLimitInformation,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+        None,
+    ):
+        library.CloseHandle(job)
+        return None
+    return job
+
+
+def _assign_process_to_job(job: int, process_handle: int | None) -> bool:
+    """把已创建（挂起）的根进程挂入 Job；后代默认全部继承"""
+    if not process_handle:
+        return False
+    return bool(_kernel32().AssignProcessToJobObject(job, process_handle))
+
+
+def _job_active_processes(job: int) -> int | None:
+    """查询 Job 内活动进程数；查询失败返回 None（按未排水处理）"""
+    info = _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+    ok = _kernel32().QueryInformationJobObject(
+        job,
+        _JobObjectBasicAccountingInformation,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+        None,
+    )
+    if not ok:
+        return None
+    return int(info.ActiveProcesses)
+
+
+def _terminate_job(job: int) -> None:
+    """终止 Job 内的全部进程（比 taskkill /T 更可靠）"""
+    _kernel32().TerminateJobObject(job, 1)
+
+
+def _close_job(job: int) -> None:
+    _kernel32().CloseHandle(job)
+
+
+def _resume_process_threads(pid: int) -> None:
+    """恢复以 CREATE_SUSPENDED 创建的进程的全部线程"""
+    library = _kernel32()
+    snapshot = library.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+    if not snapshot:
+        return
+    entry = _THREADENTRY32()
+    entry.dwSize = ctypes.sizeof(entry)
+    try:
+        found = library.Thread32First(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.th32OwnerProcessID == pid:
+                thread = library.OpenThread(
+                    _THREAD_SUSPEND_RESUME,
+                    False,
+                    entry.th32ThreadID,
+                )
+                if thread:
+                    library.ResumeThread(thread)
+                    library.CloseHandle(thread)
+            found = library.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        library.CloseHandle(snapshot)
+
+
+def _terminate_tree(process: subprocess.Popen[bytes], job: int | None) -> None:
+    """终止整棵进程树：Job 终止为主，taskkill /T 与 kill 兜底"""
+    if job is not None:
+        try:
+            _terminate_job(job)
+        except OSError:
+            pass
+    terminate_process_tree(process)
+
+
+def _tree_drained(job: int | None) -> bool:
+    """整棵树是否已到终态；查询失败按未排水处理（宁可等到超时）"""
+    if job is None:
+        return True
+    active = _job_active_processes(job)
+    return active is not None and active == 0
+
+
+def _await_tree_exit(process: subprocess.Popen[bytes], job: int | None) -> None:
+    """终止后有界等待整棵树真正退出（返回前必须到达终态）"""
+    deadline = time.monotonic() + _KILL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _tree_drained(job) and process.poll() is not None:
+            return
+        time.sleep(_TREE_DRAIN_POLL_SECONDS)
 
 
 class _StreamCollector:
@@ -139,20 +369,30 @@ def drain_readers(
 
 
 def run_bounded(
-    argv: list[str],
+    args: list[str] | str,
     *,
     cwd: Path,
     timeout_seconds: int,
     env: dict[str, str] | None = None,
     max_output_bytes: int = MAX_SUBPROCESS_OUTPUT_BYTES,
 ) -> ProcessResult:
-    """以 shell=False 执行固定命令，运行中就有界捕获 stdout/stderr
+    """执行固定命令，运行中就有界捕获 stdout/stderr
 
-    超时或任一输出流达到上限时立即终止进程树；终止后只做有界 join/close，
-    不再调用无超时的 ``communicate``。
+    ``args`` 为列表时按 C 运行时规则序列化（固定参数场景）；
+    为字符串时原样作为 Windows 命令行交给 CreateProcess（``cmd /s /c``
+    场景），绝不经过 ``list2cmdline`` 的二次转义。
+
+    完成条件：根进程退出 **且** 读取线程结束 **且** 整棵进程树
+    （Job 活动进程数归零）到达终态。超时/超限/Ctrl+C 先终止整棵树并
+    等待其退出，然后才返回。
     """
+    if isinstance(args, str) and os.name != "nt":
+        raise ValueError("raw command-line strings are only supported on Windows")
+
+    use_job = os.name == "nt"
+    creationflags = getattr(subprocess, "CREATE_SUSPENDED", 0) if use_job else 0
     process = subprocess.Popen(
-        argv,
+        args,
         cwd=str(cwd),
         shell=False,
         stdin=subprocess.DEVNULL,
@@ -160,61 +400,89 @@ def run_bounded(
         stderr=subprocess.PIPE,
         env=env if env is not None else child_environment(),
         bufsize=0,
+        creationflags=creationflags,
     )
-    assert process.stdout is not None and process.stderr is not None
-    stdout_collector = _StreamCollector(process.stdout, max_output_bytes)
-    stderr_collector = _StreamCollector(process.stderr, max_output_bytes)
-    overflow = threading.Event()
-    threads = [
-        threading.Thread(target=stdout_collector.run, args=(overflow,), daemon=True),
-        threading.Thread(target=stderr_collector.run, args=(overflow,), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
 
+    job: int | None = None
     try:
+        if use_job:
+            job = _create_kill_on_close_job()
+            if job is not None:
+                if not _assign_process_to_job(job, process._handle):
+                    _close_job(job)
+                    job = None
+            # 无论是否成功挂入 Job，都必须恢复挂起的根进程
+            _resume_process_threads(process.pid)
+
+        assert process.stdout is not None and process.stderr is not None
+        stdout_collector = _StreamCollector(process.stdout, max_output_bytes)
+        stderr_collector = _StreamCollector(process.stderr, max_output_bytes)
+        overflow = threading.Event()
+        threads = [
+            threading.Thread(
+                target=stdout_collector.run, args=(overflow,), daemon=True
+            ),
+            threading.Thread(
+                target=stderr_collector.run, args=(overflow,), daemon=True
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+
         timed_out = False
         deadline = time.monotonic() + timeout_seconds
-        while True:
-            process_done = process.poll() is not None
-            readers_done = all(not thread.is_alive() for thread in threads)
-            if process_done and readers_done:
-                break
-            if overflow.is_set():
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                break
-            time.sleep(0.01)
+        try:
+            while True:
+                process_done = process.poll() is not None
+                readers_done = all(not thread.is_alive() for thread in threads)
+                tree_done = _tree_drained(job)
+                if process_done and readers_done and tree_done:
+                    break
+                if overflow.is_set():
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.01)
 
-        if timed_out or overflow.is_set():
-            terminate_process_tree(process)
-    except KeyboardInterrupt:
-        # 取消不是普通失败：先终止整棵进程树再向上传播，
-        # 绝不让子进程在解释器让出后继续运行
-        terminate_process_tree(process)
+            if timed_out or overflow.is_set():
+                _terminate_tree(process, job)
+                # 返回前必须确认整棵树已到终态，绝不带活进程返回
+                _await_tree_exit(process, job)
+        except KeyboardInterrupt:
+            # 取消不是普通失败：先终止整棵进程树并确认退出，再向上传播
+            _terminate_tree(process, job)
+            _await_tree_exit(process, job)
+            drain_readers(process, threads)
+            raise
+
         drain_readers(process, threads)
-        raise
-
-    drain_readers(process, threads)
-    try:
-        process.wait(timeout=_KILL_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
         try:
-            process.kill()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=1)
+            process.wait(timeout=_KILL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            pass
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
 
-    return ProcessResult(
-        stdout=stdout_collector.data,
-        stderr=stderr_collector.data,
-        returncode=process.returncode,
-        timed_out=timed_out,
-        truncated=stdout_collector.truncated
-        or stderr_collector.truncated
-        or overflow.is_set(),
-    )
+        return ProcessResult(
+            stdout=stdout_collector.data,
+            stderr=stderr_collector.data,
+            returncode=process.returncode,
+            timed_out=timed_out,
+            truncated=stdout_collector.truncated
+            or stderr_collector.truncated
+            or overflow.is_set(),
+        )
+    finally:
+        # 正常路径树已排水，关闭即无副作用；异常/崩溃路径由
+        # Kill-on-close 兜底终止整棵树
+        if job is not None:
+            try:
+                _close_job(job)
+            except OSError:
+                pass
