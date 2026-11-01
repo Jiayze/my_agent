@@ -9,6 +9,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -350,7 +351,195 @@ def test_timeout_kills_detached_grandchild(
         timeout_seconds=5,
     )
 
+    # status == timed_out 本身已内含"Job 活动进程数归零"的确认
+    # （无法确认时服务会返回 unknown 而不是 timed_out）
     assert outcome.status == "timed_out"
     time.sleep(2)
     # 整树已被终止：延迟写入永远不会发生
     assert not marker.exists()
+
+
+# ---------- 返工第二轮(2026-11-01)：故障注入与协议缺口 ----------
+# 对应独立复核 R1/R2/R3,使用与审查探针相同的 patch 方式。
+
+
+_LAUNCHER_TEMPLATE = [
+    "from pathlib import Path",
+    "import subprocess, sys",
+    "Path({parent_started!r}).write_text('started')",
+    "subprocess.Popen([sys.executable, {child!r}],",
+    "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,",
+    "    stderr=subprocess.DEVNULL)",
+]
+
+_CHILD_TEMPLATE = [
+    "import time",
+    "from pathlib import Path",
+    "time.sleep({delay})",
+    "Path({marker!r}).write_text('finished')",
+]
+
+
+def _write_launcher_scripts(
+    folder: Path, *, child_delay: float
+) -> tuple[Path, Path, Path, Path]:
+    """launcher:先写 parent_started 标记再派生 stdio 全脱离的子进程"""
+    folder.mkdir(exist_ok=True)
+    parent_started = folder / "parent_started.txt"
+    marker = folder / "child_finished.txt"
+    child = folder / "child.py"
+    launcher = folder / "launcher.py"
+    child.write_text(
+        "\n".join(
+            line.format(
+                delay=child_delay,
+                marker=str(marker),
+            )
+            for line in _CHILD_TEMPLATE
+        ),
+        encoding="utf-8",
+    )
+    launcher.write_text(
+        "\n".join(
+            line.format(
+                parent_started=str(parent_started),
+                child=str(child),
+            )
+            for line in _LAUNCHER_TEMPLATE
+        ),
+        encoding="utf-8",
+    )
+    return launcher, parent_started, marker, child
+
+
+def test_delayed_job_setup_still_controls_tree(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    """R1：Job 创建被调度延迟时,挂起创建保证根进程未先行运行"""
+    import my_agent.bounded_process as bp
+
+    folder = state_dir.parent / "delayed_probe"
+    launcher, parent_started, marker, _child = _write_launcher_scripts(
+        folder, child_delay=1.2
+    )
+    service = _service(workspace, state_dir, FakeDecider())
+
+    original_create = bp._create_kill_on_close_job
+    observed: dict[str, bool] = {}
+
+    def delayed_create() -> object:
+        time.sleep(0.4)
+        observed["parent_ran_before_job"] = parent_started.exists()
+        return original_create()
+
+    with patch.object(bp, "_create_kill_on_close_job", side_effect=delayed_create):
+        outcome = service.run(f'"{sys.executable}" "{launcher}"')
+
+    assert outcome.status == "succeeded", outcome.stderr
+    # 挂起创建生效：Job 创建时根进程尚未执行任何代码
+    assert observed["parent_ran_before_job"] is False
+    assert marker.exists()
+
+
+def test_job_creation_failure_fails_closed(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    """R2：Job 创建失败必须在恢复执行前终止根进程并返回明确失败"""
+    import my_agent.bounded_process as bp
+
+    folder = state_dir.parent / "create_fail_probe"
+    launcher, _parent_started, marker, _child = _write_launcher_scripts(
+        folder, child_delay=1.0
+    )
+    service = _service(workspace, state_dir, FakeDecider())
+
+    with patch.object(bp, "_create_kill_on_close_job", return_value=None):
+        outcome = service.run(f'"{sys.executable}" "{launcher}"')
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "TREE_CONTROL_UNAVAILABLE"
+    assert service.store.get_intent(outcome.request_id).status == "failed"  # type: ignore[union-attr]
+    time.sleep(1.8)
+    # 子进程从未运行：不存在"成功返回后继续写入"
+    assert not marker.exists()
+
+
+def test_job_assignment_failure_fails_closed(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    import my_agent.bounded_process as bp
+
+    folder = state_dir.parent / "assign_fail_probe"
+    launcher, _parent_started, marker, _child = _write_launcher_scripts(
+        folder, child_delay=1.0
+    )
+    service = _service(workspace, state_dir, FakeDecider())
+
+    with patch.object(bp, "_assign_process_to_job", return_value=False):
+        outcome = service.run(f'"{sys.executable}" "{launcher}"')
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "TREE_CONTROL_UNAVAILABLE"
+    time.sleep(1.8)
+    assert not marker.exists()
+
+
+def test_resume_failure_fails_closed(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    """恢复失败同样 fail closed,不留挂起根进程也不执行命令"""
+    import my_agent.bounded_process as bp
+
+    folder = state_dir.parent / "resume_fail_probe"
+    launcher, _parent_started, marker, _child = _write_launcher_scripts(
+        folder, child_delay=1.0
+    )
+    service = _service(workspace, state_dir, FakeDecider())
+
+    with patch.object(bp, "_resume_process_threads", return_value=False):
+        outcome = service.run(f'"{sys.executable}" "{launcher}"')
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "TREE_CONTROL_UNAVAILABLE"
+    time.sleep(1.8)
+    assert not marker.exists()
+
+
+def test_unconfirmed_tree_exit_maps_to_unknown(
+    workspace: Path,
+    state_dir: Path,
+) -> None:
+    """R3：终止后无法确认整树终态时必须返回 unknown,而不是普通结果"""
+    import my_agent.bounded_process as bp
+
+    service = _service(workspace, state_dir, FakeDecider())
+
+    with patch.object(bp, "_tree_drained", return_value=False):
+        outcome = service.run("echo never-confirmed", timeout_seconds=5)
+
+    assert outcome.status == "unknown"
+    assert "未确认" in outcome.message
+    intent = service.store.get_intent(outcome.request_id)
+    assert intent is not None
+    assert intent.status == "unknown"
+    audits = service.store.list_shell_audits()
+    assert audits[-1]["status"] == "unknown"
+
+
+def test_await_tree_exit_returns_explicit_confirmation() -> None:
+    """R3：_await_tree_exit 必须返回可区分的确认状态"""
+    import my_agent.bounded_process as bp
+
+    class FakeProcess:
+        def poll(self) -> int:
+            return 0
+
+    with patch.object(bp, "_tree_drained", return_value=True):
+        assert bp._await_tree_exit(FakeProcess(), None) is True
+
+    with patch.object(bp, "_tree_drained", return_value=False):
+        assert bp._await_tree_exit(FakeProcess(), object()) is False

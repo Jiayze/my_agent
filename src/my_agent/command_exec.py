@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from my_agent.approval import ApprovalRequest, ApprovalService
-from my_agent.bounded_process import child_environment, run_bounded
+from my_agent.bounded_process import (
+    ProcessTreeControlError,
+    child_environment,
+    run_bounded,
+)
 from my_agent.exec_policy import MAX_COMMAND_CHARS, evaluate_command
 from my_agent.side_effects.intent_store import IntentRecord, IntentStore, utc_now_iso
 from my_agent.tools.path_policy import redact_text, truncate_utf8
@@ -233,25 +237,69 @@ class CommandExecutionService:
                 timeout_seconds=effective_timeout,
                 env=child_environment(),
             )
-        except KeyboardInterrupt:
-            # 取消不是普通失败：进程树已由 run_bounded 终止，
-            # intent 记为 failed（未完成）后向上传播，由 CLI 按"取消本轮"处理
+        except KeyboardInterrupt as error:
             duration_ms = (time.perf_counter() - started) * 1000
-            self.store.mark_failed(request_id, "KeyboardInterrupt")
+            unconfirmed = getattr(error, "tree_exit_unconfirmed", False)
+            if unconfirmed:
+                # 取消后终止未确认：结果未知，等待人工检查，绝不报告普通失败
+                self.store.mark_unknown(request_id)
+                self.store.record_shell_audit(
+                    request_id,
+                    command=command,
+                    decision="allowed_once",
+                    decided_by=decided_by,
+                    status="unknown",
+                    duration_ms=duration_ms,
+                )
+                logger.error(
+                    "command interrupted but tree exit unconfirmed; "
+                    "request_id=%s duration_ms=%.1f",
+                    request_id,
+                    duration_ms,
+                )
+            else:
+                # 取消不是普通失败：进程树已终止并确认退出，
+                # intent 记为 failed（未完成）后向上传播，由 CLI 按"取消本轮"处理
+                self.store.mark_failed(request_id, "KeyboardInterrupt")
+                self.store.record_shell_audit(
+                    request_id,
+                    command=command,
+                    decision="allowed_once",
+                    decided_by=decided_by,
+                    status="interrupted",
+                    duration_ms=duration_ms,
+                )
+                logger.warning(
+                    "command interrupted by user; request_id=%s duration_ms=%.1f",
+                    request_id,
+                    duration_ms,
+                )
+            raise
+        except ProcessTreeControlError:
+            # Job/挂起/恢复机制不可用：命令在恢复执行前已被清理，
+            # 未产生任何副作用——fail closed 返回明确失败
+            duration_ms = (time.perf_counter() - started) * 1000
+            self.store.mark_failed(request_id, "ProcessTreeControlError")
             self.store.record_shell_audit(
                 request_id,
                 command=command,
                 decision="allowed_once",
                 decided_by=decided_by,
-                status="interrupted",
+                status="failed",
                 duration_ms=duration_ms,
             )
-            logger.warning(
-                "command interrupted by user; request_id=%s duration_ms=%.1f",
+            logger.error(
+                "process tree control unavailable; request_id=%s duration_ms=%.1f",
                 request_id,
                 duration_ms,
             )
-            raise
+            return CommandOutcome(
+                status="failed",
+                request_id=request_id,
+                duration_ms=duration_ms,
+                error_code="TREE_CONTROL_UNAVAILABLE",
+                message=("进程树控制不可用，命令已在执行前取消，未产生任何副作用。"),
+            )
         except OSError as error:
             duration_ms = (time.perf_counter() - started) * 1000
             self.store.mark_failed(request_id, type(error).__name__)
@@ -279,6 +327,35 @@ class CommandExecutionService:
         duration_ms = (time.perf_counter() - started) * 1000
         exit_code = process_result.returncode
         timed_out = process_result.timed_out
+        if not process_result.tree_exit_confirmed:
+            # 终止后无法确认整棵树到终态：结果未知，等待人工检查，
+            # 绝不能压成普通成功/失败/超时
+            self.store.mark_unknown(request_id)
+            self.store.record_shell_audit(
+                request_id,
+                command=command,
+                decision="allowed_once",
+                decided_by=decided_by,
+                status="unknown",
+                exit_code=exit_code,
+                timed_out=timed_out,
+                duration_ms=duration_ms,
+            )
+            logger.error(
+                "command tree exit unconfirmed; request_id=%s duration_ms=%.1f",
+                request_id,
+                duration_ms,
+            )
+            return CommandOutcome(
+                status="unknown",
+                request_id=request_id,
+                exit_code=exit_code,
+                stdout=_presentable_output(process_result.stdout),
+                stderr=_presentable_output(process_result.stderr),
+                truncated=process_result.truncated,
+                duration_ms=duration_ms,
+                message="终止未确认，结果未知，请人工检查目标状态后重试。",
+            )
         if timed_out:
             status = "timed_out"
         elif exit_code == 0:

@@ -42,7 +42,8 @@ def build_shell_tool(service: CommandExecutionService) -> tuple[BaseTool, ...]:
         返回（含分离的后代进程）；后台常驻进程会被视为超时并整树终止。
         输出有界捕获并脱敏。timeout_seconds 仅在部署配置允许的范围内
         生效。结果包含 status（succeeded/failed/timed_out/denied/
-        unavailable）、exit_code 与脱敏后的 stdout/stderr。
+        unavailable/unknown——终止未确认时结果未知）、exit_code 与脱敏后的
+        stdout/stderr。
         命令不可重试：已启动但结果未知时再次执行等于第二次真实副作用。
         """
         outcome = service.run(command, timeout_seconds)

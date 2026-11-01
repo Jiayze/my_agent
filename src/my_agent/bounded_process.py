@@ -252,15 +252,20 @@ def _close_job(job: int) -> None:
     _kernel32().CloseHandle(job)
 
 
-def _resume_process_threads(pid: int) -> None:
-    """恢复以 CREATE_SUSPENDED 创建的进程的全部线程"""
+def _resume_process_threads(pid: int) -> bool:
+    """恢复以 CREATE_SUSPENDED 创建的进程的全部线程并验证成功
+
+    返回 ``False`` 表示没有任何线程被成功恢复或任一恢复调用失败；
+    调用方必须清理尚未运行的根进程，不得继续执行。
+    """
     library = _kernel32()
     snapshot = library.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
     if not snapshot:
-        return
-    entry = _THREADENTRY32()
-    entry.dwSize = ctypes.sizeof(entry)
+        return False
+    resumed = False
     try:
+        entry = _THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(entry)
         found = library.Thread32First(snapshot, ctypes.byref(entry))
         while found:
             if entry.th32OwnerProcessID == pid:
@@ -270,21 +275,31 @@ def _resume_process_threads(pid: int) -> None:
                     entry.th32ThreadID,
                 )
                 if thread:
-                    library.ResumeThread(thread)
+                    # ResumeThread 返回之前的挂起计数；-1（0xFFFFFFFF）为失败
+                    result = library.ResumeThread(thread)
                     library.CloseHandle(thread)
+                    if result == 0xFFFFFFFF:
+                        return False
+                    resumed = True
             found = library.Thread32Next(snapshot, ctypes.byref(entry))
     finally:
         library.CloseHandle(snapshot)
+    return resumed
 
 
-def _terminate_tree(process: subprocess.Popen[bytes], job: int | None) -> None:
-    """终止整棵进程树：Job 终止为主，taskkill /T 与 kill 兜底"""
+def _terminate_tree(process: subprocess.Popen[bytes], job: int | None) -> bool:
+    """终止整棵进程树：Job 终止为主，taskkill /T 与 kill 兜底
+
+    返回 Job 终止调用是否成功；最终以 ``_await_tree_exit`` 的确认为准。
+    """
+    job_terminated = True
     if job is not None:
         try:
-            _terminate_job(job)
+            job_terminated = bool(_terminate_job(job))
         except OSError:
-            pass
+            job_terminated = False
     terminate_process_tree(process)
+    return job_terminated
 
 
 def _tree_drained(job: int | None) -> bool:
@@ -295,13 +310,37 @@ def _tree_drained(job: int | None) -> bool:
     return active is not None and active == 0
 
 
-def _await_tree_exit(process: subprocess.Popen[bytes], job: int | None) -> None:
-    """终止后有界等待整棵树真正退出（返回前必须到达终态）"""
+def _await_tree_exit(process: subprocess.Popen[bytes], job: int | None) -> bool:
+    """终止后有界等待整棵树真正退出
+
+    返回 ``True`` 表示已确认根进程退出且 Job 活动进程数归零；
+    返回 ``False`` 表示期限耗尽仍无法确认——调用方必须保留
+    unknown/终止未确认语义，绝不能当作已确认处理。
+    """
     deadline = time.monotonic() + _KILL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if _tree_drained(job) and process.poll() is not None:
-            return
+            return True
         time.sleep(_TREE_DRAIN_POLL_SECONDS)
+    return False
+
+
+def _cleanup_unstarted_root(process: subprocess.Popen[bytes]) -> None:
+    """清理尚未开始执行的挂起根进程及其管道，不留挂起残留"""
+    try:
+        process.kill()
+    except OSError:
+        pass
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class _StreamCollector:
@@ -342,13 +381,27 @@ class _StreamCollector:
 
 @dataclass(frozen=True)
 class ProcessResult:
-    """有界子进程结果"""
+    """有界子进程结果
+
+    ``tree_exit_confirmed`` 为 ``False`` 表示终止后未能确认整棵树到达
+    终态（等待耗尽/查询失败），调用方必须按"结果未知"处理，不得报告
+    普通成功或失败。
+    """
 
     stdout: bytes
     stderr: bytes
     returncode: int | None
     timed_out: bool
     truncated: bool
+    tree_exit_confirmed: bool = True
+
+
+class ProcessTreeControlError(RuntimeError):
+    """进程树控制机制（Job Object/挂起/恢复）不可用
+
+    此时命令**尚未开始执行**（根进程仍处于挂起态并已被清理）；
+    调用方必须 fail closed 返回明确失败，绝不能降级为无 Job 执行。
+    """
 
 
 def drain_readers(
@@ -390,7 +443,11 @@ def run_bounded(
         raise ValueError("raw command-line strings are only supported on Windows")
 
     use_job = os.name == "nt"
-    creationflags = getattr(subprocess, "CREATE_SUSPENDED", 0) if use_job else 0
+    # 微软文档：CREATE_SUSPENDED = 0x00000004。subprocess 模块**没有**
+    # 暴露该常量（Python 3.13.2 实测），getattr 缺省为 0 会让进程先运行、
+    # 后绑定 Job，存在接管竞态——必须使用字面常量。
+    _CREATE_SUSPENDED = 0x00000004
+    creationflags = _CREATE_SUSPENDED if use_job else 0
     process = subprocess.Popen(
         args,
         cwd=str(cwd),
@@ -404,20 +461,31 @@ def run_bounded(
     )
 
     job: int | None = None
+    overflow = threading.Event()
+    threads: list[threading.Thread] = []
+    tree_exit_confirmed = True
     try:
         if use_job:
+            # Job 是兑现生命周期契约的必需机制：创建/绑定/恢复任一失败
+            # 都在恢复执行前 fail closed，清理挂起的根进程，绝不降级
             job = _create_kill_on_close_job()
-            if job is not None:
-                if not _assign_process_to_job(job, process._handle):
-                    _close_job(job)
-                    job = None
-            # 无论是否成功挂入 Job，都必须恢复挂起的根进程
-            _resume_process_threads(process.pid)
+            if job is None:
+                raise ProcessTreeControlError(
+                    "could not create the job object; command not executed"
+                )
+            if not _assign_process_to_job(job, process._handle):
+                raise ProcessTreeControlError(
+                    "could not assign the root process to the job object; "
+                    "command not executed"
+                )
+            if not _resume_process_threads(process.pid):
+                raise ProcessTreeControlError(
+                    "could not resume the suspended root process; command not executed"
+                )
 
         assert process.stdout is not None and process.stderr is not None
         stdout_collector = _StreamCollector(process.stdout, max_output_bytes)
         stderr_collector = _StreamCollector(process.stderr, max_output_bytes)
-        overflow = threading.Event()
         threads = [
             threading.Thread(
                 target=stdout_collector.run, args=(overflow,), daemon=True
@@ -447,14 +515,22 @@ def run_bounded(
 
             if timed_out or overflow.is_set():
                 _terminate_tree(process, job)
-                # 返回前必须确认整棵树已到终态，绝不带活进程返回
-                _await_tree_exit(process, job)
+                # 返回前必须确认整棵树已到终态；无法确认时由调用方按
+                # "结果未知"处理，绝不带活进程报告普通结果
+                tree_exit_confirmed = _await_tree_exit(process, job)
         except KeyboardInterrupt:
-            # 取消不是普通失败：先终止整棵进程树并确认退出，再向上传播
+            # 取消不是普通失败：先终止整棵进程树并确认退出，再向上传播；
+            # 无法确认时向上携带 tree_exit_unconfirmed 标记
             _terminate_tree(process, job)
-            _await_tree_exit(process, job)
+            confirmed = _await_tree_exit(process, job)
             drain_readers(process, threads)
-            raise
+            if confirmed:
+                raise
+            cancelled = KeyboardInterrupt(
+                "process tree exit unconfirmed after interrupt"
+            )
+            cancelled.tree_exit_unconfirmed = True  # type: ignore[attr-defined]
+            raise cancelled from None
 
         drain_readers(process, threads)
         try:
@@ -477,7 +553,12 @@ def run_bounded(
             truncated=stdout_collector.truncated
             or stderr_collector.truncated
             or overflow.is_set(),
+            tree_exit_confirmed=tree_exit_confirmed,
         )
+    except ProcessTreeControlError:
+        # fail closed：根进程仍处于挂起态、命令从未执行——清理残留并向上传播
+        _cleanup_unstarted_root(process)
+        raise
     finally:
         # 正常路径树已排水，关闭即无副作用；异常/崩溃路径由
         # Kill-on-close 兜底终止整棵树
